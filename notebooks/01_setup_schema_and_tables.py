@@ -1,636 +1,677 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Financial Close Lakehouse - Schema and Table Setup
+# MAGIC # Financial Close - Schema and Table Setup
 # MAGIC 
-# MAGIC **Purpose:** Initialize Unity Catalog structure for the financial close solution
+# MAGIC This notebook creates the Unity Catalog structure for the intelligent financial close solution:
+# MAGIC - Catalog: `financial_close_catalog`
+# MAGIC - Schemas: `bronze_layer`, `silver_layer`, `gold_layer`
+# MAGIC - All Delta tables with proper schema, partitioning, and comments
 # MAGIC 
-# MAGIC **Creates:**
-# MAGIC - Catalog: `financial_close_lakehouse`
-# MAGIC - Schemas: `bronze`, `silver`, `gold`, `config`
-# MAGIC - All Delta tables with column comments and constraints
-# MAGIC 
-# MAGIC **Execution time:** ~2 minutes
-# MAGIC 
-# MAGIC **Prerequisites:** Unity Catalog enabled, permissions to create catalogs
+# MAGIC **Run this notebook once** during initial setup or when schema changes are needed.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Create Catalog and Schemas
+# MAGIC ## Configuration
 
 # COMMAND ----------
 
-# Create catalog if not exists
-spark.sql("""
-  CREATE CATALOG IF NOT EXISTS financial_close_lakehouse
-  COMMENT 'Lakehouse for intelligent financial close automation with Bronze/Silver/Gold layers'
-""")
+# Catalog and schema configuration
+CATALOG = "financial_close_catalog"
+BRONZE_SCHEMA = "bronze_layer"
+SILVER_SCHEMA = "silver_layer"
+GOLD_SCHEMA = "gold_layer"
 
-# Set as current catalog
-spark.sql("USE CATALOG financial_close_lakehouse")
+# Storage location (adjust based on your environment)
+CATALOG_LOCATION = "abfss://your-container@your-storage-account.dfs.core.windows.net/financial_close"
 
-print("✓ Catalog 'financial_close_lakehouse' ready")
-
-# COMMAND ----------
-
-# Create Bronze schema (raw data landing)
-spark.sql("""
-  CREATE SCHEMA IF NOT EXISTS bronze
-  COMMENT 'Raw data landing zone - unchanged from source systems'
-""")
-
-# Create Silver schema (standardized)
-spark.sql("""
-  CREATE SCHEMA IF NOT EXISTS silver
-  COMMENT 'Standardized and validated data with business rules applied'
-""")
-
-# Create Gold schema (consumption-ready)
-spark.sql("""
-  CREATE SCHEMA IF NOT EXISTS gold
-  COMMENT 'Curated, aggregated data optimized for analytics and dashboards'
-""")
-
-# Create Config schema (metadata and reference data)
-spark.sql("""
-  CREATE SCHEMA IF NOT EXISTS config
-  COMMENT 'Configuration tables for business units, close phases, and agent settings'
-""")
-
-print("✓ Schemas created: bronze, silver, gold, config")
+print(f"Setting up catalog: {CATALOG}")
+print(f"Storage location: {CATALOG_LOCATION}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Create Config Tables (Metadata)
+# MAGIC ## Create Catalog and Schemas
 
 # COMMAND ----------
 
-# Business Units reference table
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS config.business_units (
-    bu_code STRING COMMENT 'Business unit code (e.g., NA, EU, ASIA)',
-    bu_name STRING COMMENT 'Business unit full name',
-    region STRING COMMENT 'Geographic region',
-    functional_currency STRING COMMENT 'Functional currency code (e.g., USD, EUR)',
-    reporting_currency STRING COMMENT 'Group reporting currency (always USD)',
-    is_active BOOLEAN COMMENT 'Whether BU is active in current close',
-    created_at TIMESTAMP COMMENT 'Record creation timestamp',
-    updated_at TIMESTAMP COMMENT 'Record last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Master list of business units participating in financial close'
+# Create catalog
+spark.sql(f"""
+CREATE CATALOG IF NOT EXISTS {CATALOG}
+COMMENT 'Financial close intelligent solution - Lakehouse for FP&A automation'
 """)
 
-print("✓ Created: config.business_units")
+# Set current catalog
+spark.sql(f"USE CATALOG {CATALOG}")
+
+print(f"✓ Catalog {CATALOG} created/verified")
 
 # COMMAND ----------
 
-# Close phases and tasks metadata
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS config.close_phase_definitions (
-    phase_id INT COMMENT 'Phase number (1-5)',
-    phase_name STRING COMMENT 'Phase name (e.g., Data Gathering, Adjustments)',
-    phase_description STRING COMMENT 'Detailed description of phase activities',
-    typical_duration_days INT COMMENT 'Expected duration in business days',
-    task_id INT COMMENT 'Task number within phase',
-    task_name STRING COMMENT 'Task name',
-    task_description STRING COMMENT 'Detailed task description',
-    owner_role STRING COMMENT 'Responsible role (FP&A, Accounting, Tech)',
-    is_bu_specific BOOLEAN COMMENT 'Whether task applies to each BU separately',
-    depends_on_tasks ARRAY<INT> COMMENT 'List of task_ids that must complete first',
-    created_at TIMESTAMP COMMENT 'Record creation timestamp'
-  )
-  USING DELTA
-  COMMENT 'Master definition of close phases and tasks - template for each period'
+# Create Bronze schema
+spark.sql(f"""
+CREATE SCHEMA IF NOT EXISTS {BRONZE_SCHEMA}
+COMMENT 'Raw landing zone for all financial close input files'
 """)
 
-print("✓ Created: config.close_phase_definitions")
-
-# COMMAND ----------
-
-# Agent configuration
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS config.agent_configuration (
-    agent_name STRING COMMENT 'Agent identifier (e.g., fx_agent, supervisor_agent)',
-    agent_type STRING COMMENT 'Agent type (orchestrator, domain, reporting)',
-    is_enabled BOOLEAN COMMENT 'Whether agent is active',
-    run_frequency STRING COMMENT 'How often agent runs (hourly, daily, on_demand)',
-    config_json STRING COMMENT 'JSON blob with agent-specific configuration',
-    last_run_timestamp TIMESTAMP COMMENT 'Last execution timestamp',
-    created_at TIMESTAMP COMMENT 'Record creation timestamp',
-    updated_at TIMESTAMP COMMENT 'Record last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Configuration and runtime state for all agents'
+# Create Silver schema
+spark.sql(f"""
+CREATE SCHEMA IF NOT EXISTS {SILVER_SCHEMA}
+COMMENT 'Standardized and cleaned financial close data'
 """)
 
-print("✓ Created: config.agent_configuration")
+# Create Gold schema
+spark.sql(f"""
+CREATE SCHEMA IF NOT EXISTS {GOLD_SCHEMA}
+COMMENT 'Consumption-ready financial close results and KPIs'
+""")
+
+print(f"✓ Schema {BRONZE_SCHEMA} created/verified")
+print(f"✓ Schema {SILVER_SCHEMA} created/verified")
+print(f"✓ Schema {GOLD_SCHEMA} created/verified")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Create Bronze Tables (Raw Data Landing)
-
-# COMMAND ----------
-
-# FX rates raw
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS bronze.fx_rates_raw (
-    load_timestamp TIMESTAMP COMMENT 'When file was loaded into Databricks',
-    file_name STRING COMMENT 'Source file name',
-    provider STRING COMMENT 'FX data provider (e.g., Bloomberg, Reuters, ECB)',
-    rate_date DATE COMMENT 'Date for which rate is valid',
-    base_currency STRING COMMENT 'Base currency code (e.g., USD)',
-    quote_currency STRING COMMENT 'Quote currency code (e.g., EUR)',
-    rate DECIMAL(18,6) COMMENT 'Exchange rate (1 base_currency = rate quote_currency)',
-    rate_type STRING COMMENT 'Rate type (spot, average, month-end)',
-    raw_record STRING COMMENT 'Original record as received (for audit)'
-  )
-  USING DELTA
-  COMMENT 'Raw exchange rate files from external providers - unvalidated'
-""")
-
-print("✓ Created: bronze.fx_rates_raw")
-
-# COMMAND ----------
-
-# BU preliminary close raw
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS bronze.bu_pre_close_raw (
-    load_timestamp TIMESTAMP COMMENT 'When file was loaded',
-    file_name STRING COMMENT 'Source file name',
-    bu_code STRING COMMENT 'Business unit code',
-    period STRING COMMENT 'Fiscal period (YYYY-MM)',
-    cut_version STRING COMMENT 'Version: preliminary, cut1, cut2/final',
-    account_code STRING COMMENT 'GL account code',
-    account_name STRING COMMENT 'GL account name',
-    cost_center STRING COMMENT 'Cost center code',
-    segment STRING COMMENT 'Segment code',
-    local_currency STRING COMMENT 'Local currency code',
-    local_amount DECIMAL(18,2) COMMENT 'Amount in local currency',
-    raw_record STRING COMMENT 'Original record as received'
-  )
-  USING DELTA
-  COMMENT 'Preliminary trial balance files from business units - all versions'
-""")
-
-print("✓ Created: bronze.bu_pre_close_raw")
-
-# COMMAND ----------
-
-# BU segmented close raw
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS bronze.bu_segmented_raw (
-    load_timestamp TIMESTAMP COMMENT 'When file was loaded',
-    file_name STRING COMMENT 'Source file name',
-    bu_code STRING COMMENT 'Business unit code',
-    period STRING COMMENT 'Fiscal period (YYYY-MM)',
-    segment STRING COMMENT 'Segment identifier',
-    product STRING COMMENT 'Product line',
-    region STRING COMMENT 'Geographic region',
-    account_category STRING COMMENT 'P&L line (Revenue, COGS, OpEx)',
-    local_currency STRING COMMENT 'Local currency code',
-    local_amount DECIMAL(18,2) COMMENT 'Amount in local currency',
-    raw_record STRING COMMENT 'Original record as received'
-  )
-  USING DELTA
-  COMMENT 'Segmented P&L data from business units - detailed by segment/product/region'
-""")
-
-print("✓ Created: bronze.bu_segmented_raw")
-
-# COMMAND ----------
-
-# BU forecast raw
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS bronze.bu_forecast_raw (
-    load_timestamp TIMESTAMP COMMENT 'When file was loaded',
-    file_name STRING COMMENT 'Source file name',
-    bu_code STRING COMMENT 'Business unit code',
-    forecast_version STRING COMMENT 'Forecast version (e.g., Jan26_v1)',
-    forecast_period STRING COMMENT 'Period being forecasted (YYYY-MM)',
-    scenario STRING COMMENT 'Scenario: Base, Upside, Downside',
-    account_category STRING COMMENT 'P&L line (Revenue, COGS, OpEx)',
-    segment STRING COMMENT 'Segment identifier',
-    local_currency STRING COMMENT 'Local currency code',
-    local_amount DECIMAL(18,2) COMMENT 'Forecasted amount in local currency',
-    raw_record STRING COMMENT 'Original record as received'
-  )
-  USING DELTA
-  COMMENT 'Forecast submissions from business units - multiple scenarios and versions'
-""")
-
-print("✓ Created: bronze.bu_forecast_raw")
-
-# COMMAND ----------
-
-# FX forecast raw
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS bronze.fx_forecast_raw (
-    load_timestamp TIMESTAMP COMMENT 'When file was loaded',
-    file_name STRING COMMENT 'Source file name',
-    forecast_date DATE COMMENT 'Date for which rate is forecasted',
-    base_currency STRING COMMENT 'Base currency code',
-    quote_currency STRING COMMENT 'Quote currency code',
-    forecasted_rate DECIMAL(18,6) COMMENT 'Forecasted exchange rate',
-    scenario STRING COMMENT 'Scenario: Base, Upside, Downside',
-    raw_record STRING COMMENT 'Original record as received'
-  )
-  USING DELTA
-  COMMENT 'Forecasted exchange rates - forward curves for planning'
-""")
-
-print("✓ Created: bronze.fx_forecast_raw")
+# MAGIC ## Bronze Layer Tables
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Create Silver Tables (Standardized Data)
+# MAGIC ### fx_rates_raw - Raw FX rates from providers
 
 # COMMAND ----------
 
-# FX rates standardized
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS silver.fx_rates_std (
-    rate_date DATE COMMENT 'Date for which rate is valid',
-    base_currency STRING COMMENT 'Base currency code (always USD for reporting)',
-    quote_currency STRING COMMENT 'Quote currency code',
-    rate DECIMAL(18,6) COMMENT 'Standardized exchange rate',
-    rate_type STRING COMMENT 'Rate type (spot, average, month-end)',
-    is_latest BOOLEAN COMMENT 'Flag indicating most recent rate for this date',
-    quality_score DECIMAL(3,2) COMMENT 'Data quality score (0.0-1.0)',
-    source_provider STRING COMMENT 'Original provider',
-    created_at TIMESTAMP COMMENT 'When record was created in Silver',
-    updated_at TIMESTAMP COMMENT 'Last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Cleaned and standardized FX rates - one rate per date per currency pair'
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {BRONZE_SCHEMA}.fx_rates_raw (
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when file was loaded',
+  file_name STRING COMMENT 'Source file name',
+  provider STRING COMMENT 'FX rate provider (e.g., Bloomberg, Reuters)',
+  rate_date DATE COMMENT 'Date for which the FX rate is valid',
+  from_currency STRING COMMENT 'Source currency code (ISO 4217)',
+  to_currency STRING COMMENT 'Target currency code (ISO 4217)',
+  exchange_rate DECIMAL(18,6) COMMENT 'Exchange rate from source to target currency',
+  rate_type STRING COMMENT 'Rate type: spot, average, month-end',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (rate_date)
+COMMENT 'Raw foreign exchange rates from external providers'
 """)
 
-print("✓ Created: silver.fx_rates_std")
-
-# COMMAND ----------
-
-# Close trial balance standardized
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS silver.close_trial_balance_std (
-    period STRING COMMENT 'Fiscal period (YYYY-MM)',
-    bu_code STRING COMMENT 'Business unit code',
-    cut_version STRING COMMENT 'Version: preliminary, cut1, cut2/final',
-    version_timestamp TIMESTAMP COMMENT 'When this version was received',
-    account_code STRING COMMENT 'Standardized GL account code',
-    account_name STRING COMMENT 'GL account name',
-    account_category STRING COMMENT 'Rollup category (Revenue, COGS, OpEx, etc.)',
-    cost_center STRING COMMENT 'Cost center code',
-    segment STRING COMMENT 'Segment code',
-    local_currency STRING COMMENT 'Local currency code',
-    local_amount DECIMAL(18,2) COMMENT 'Amount in local currency',
-    reporting_currency STRING COMMENT 'Reporting currency (USD)',
-    reporting_amount DECIMAL(18,2) COMMENT 'Amount in reporting currency',
-    fx_rate DECIMAL(18,6) COMMENT 'FX rate used for conversion',
-    is_current_version BOOLEAN COMMENT 'Flag for latest version',
-    created_at TIMESTAMP COMMENT 'When record was created in Silver',
-    updated_at TIMESTAMP COMMENT 'Last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Standardized trial balance with all versions and FX conversion'
-""")
-
-print("✓ Created: silver.close_trial_balance_std")
-
-# COMMAND ----------
-
-# Segmented close standardized
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS silver.segmented_close_std (
-    period STRING COMMENT 'Fiscal period (YYYY-MM)',
-    bu_code STRING COMMENT 'Business unit code',
-    segment STRING COMMENT 'Segment identifier',
-    product STRING COMMENT 'Product line',
-    region STRING COMMENT 'Geographic region',
-    account_category STRING COMMENT 'P&L line (Revenue, COGS, OpEx)',
-    local_currency STRING COMMENT 'Local currency code',
-    local_amount DECIMAL(18,2) COMMENT 'Amount in local currency',
-    reporting_currency STRING COMMENT 'Reporting currency (USD)',
-    reporting_amount DECIMAL(18,2) COMMENT 'Amount in reporting currency',
-    fx_rate DECIMAL(18,6) COMMENT 'FX rate used for conversion',
-    created_at TIMESTAMP COMMENT 'When record was created in Silver',
-    updated_at TIMESTAMP COMMENT 'Last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Standardized segmented close data - reconciles to trial balance'
-""")
-
-print("✓ Created: silver.segmented_close_std")
-
-# COMMAND ----------
-
-# Forecast standardized
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS silver.forecast_std (
-    forecast_version STRING COMMENT 'Forecast version identifier',
-    forecast_created_at TIMESTAMP COMMENT 'When forecast was created',
-    bu_code STRING COMMENT 'Business unit code',
-    forecast_period STRING COMMENT 'Period being forecasted (YYYY-MM)',
-    scenario STRING COMMENT 'Scenario: Base, Upside, Downside',
-    account_category STRING COMMENT 'P&L line (Revenue, COGS, OpEx)',
-    segment STRING COMMENT 'Segment identifier',
-    local_currency STRING COMMENT 'Local currency code',
-    local_amount DECIMAL(18,2) COMMENT 'Forecasted amount in local currency',
-    reporting_currency STRING COMMENT 'Reporting currency (USD)',
-    reporting_amount DECIMAL(18,2) COMMENT 'Amount in reporting currency',
-    fx_rate DECIMAL(18,6) COMMENT 'FX rate used for conversion',
-    is_current_version BOOLEAN COMMENT 'Flag for latest forecast version',
-    created_at TIMESTAMP COMMENT 'When record was created in Silver',
-    updated_at TIMESTAMP COMMENT 'Last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Standardized forecast data with versioning and FX conversion'
-""")
-
-print("✓ Created: silver.forecast_std")
+print("✓ Table fx_rates_raw created/verified")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Create Gold Tables (Consumption-Ready)
+# MAGIC ### bu_pre_close_raw - Preliminary close files from BUs
 
 # COMMAND ----------
 
-# Close status tracking
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS gold.close_status_gold (
-    period STRING COMMENT 'Fiscal period (YYYY-MM)',
-    phase_id INT COMMENT 'Phase number (1-5)',
-    phase_name STRING COMMENT 'Phase name',
-    task_id INT COMMENT 'Task identifier',
-    task_name STRING COMMENT 'Task name',
-    bu_code STRING COMMENT 'Business unit code (NULL for group-level tasks)',
-    planned_due_date DATE COMMENT 'Planned completion date',
-    actual_completion_timestamp TIMESTAMP COMMENT 'Actual completion timestamp',
-    status STRING COMMENT 'Status: pending, in_progress, completed, blocked',
-    owner_role STRING COMMENT 'Responsible role (FP&A, Accounting, Tech)',
-    comments STRING COMMENT 'Status updates and agent-generated summaries',
-    last_updated_by STRING COMMENT 'User or agent that last updated',
-    created_at TIMESTAMP COMMENT 'Record creation timestamp',
-    updated_at TIMESTAMP COMMENT 'Last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Real-time status tracking for all close phases and tasks'
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {BRONZE_SCHEMA}.bu_pre_close_raw (
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when file was loaded',
+  file_name STRING COMMENT 'Source file name',
+  period INT COMMENT 'Period in YYYYMM format',
+  bu STRING COMMENT 'Business unit code',
+  cut_type STRING COMMENT 'Preliminary, first_cut, or final_cut',
+  account_code STRING COMMENT 'GL account code',
+  account_name STRING COMMENT 'GL account description',
+  cost_center STRING COMMENT 'Cost center code',
+  local_currency STRING COMMENT 'Local currency code',
+  local_amount DECIMAL(18,2) COMMENT 'Amount in local currency',
+  reporting_currency STRING COMMENT 'Reporting currency code (typically USD)',
+  reporting_amount DECIMAL(18,2) COMMENT 'Amount in reporting currency',
+  segment STRING COMMENT 'Business segment',
+  region STRING COMMENT 'Geographic region',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (period, bu)
+COMMENT 'Raw preliminary close trial balance files submitted by business units'
 """)
 
-print("✓ Created: gold.close_status_gold")
-
-# COMMAND ----------
-
-# Close results
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS gold.close_results_gold (
-    period STRING COMMENT 'Fiscal period (YYYY-MM)',
-    bu_code STRING COMMENT 'Business unit code (CONSOLIDATED for group)',
-    segment STRING COMMENT 'Segment identifier (NULL for consolidated)',
-    product STRING COMMENT 'Product line (NULL for consolidated)',
-    region STRING COMMENT 'Geographic region (NULL for consolidated)',
-    account_category STRING COMMENT 'P&L line (Revenue, COGS, OpEx, Operating Profit)',
-    actual_amount DECIMAL(18,2) COMMENT 'Actual amount from close (USD)',
-    forecast_amount DECIMAL(18,2) COMMENT 'Forecasted amount (USD)',
-    prior_period_amount DECIMAL(18,2) COMMENT 'Prior period actual (USD)',
-    variance_vs_forecast DECIMAL(18,2) COMMENT 'Variance: actual - forecast',
-    variance_vs_forecast_pct DECIMAL(5,2) COMMENT 'Variance % vs forecast',
-    variance_vs_prior DECIMAL(18,2) COMMENT 'Variance: actual - prior period',
-    variance_vs_prior_pct DECIMAL(5,2) COMMENT 'Variance % vs prior period',
-    fx_impact DECIMAL(18,2) COMMENT 'FX impact vs local currency',
-    created_at TIMESTAMP COMMENT 'Record creation timestamp',
-    updated_at TIMESTAMP COMMENT 'Last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Final close results with variance analysis - segmented and consolidated'
-""")
-
-print("✓ Created: gold.close_results_gold")
-
-# COMMAND ----------
-
-# Forecast results
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS gold.forecast_results_gold (
-    forecast_version STRING COMMENT 'Forecast version identifier',
-    forecast_period STRING COMMENT 'Period being forecasted (YYYY-MM)',
-    bu_code STRING COMMENT 'Business unit code (CONSOLIDATED for group)',
-    segment STRING COMMENT 'Segment identifier (NULL for consolidated)',
-    scenario STRING COMMENT 'Scenario: Base, Upside, Downside',
-    account_category STRING COMMENT 'P&L line (Revenue, COGS, OpEx, Operating Profit)',
-    forecast_amount DECIMAL(18,2) COMMENT 'Forecasted amount (USD)',
-    prior_forecast_amount DECIMAL(18,2) COMMENT 'Previous forecast for same period (USD)',
-    variance_vs_prior_forecast DECIMAL(18,2) COMMENT 'Change from previous forecast',
-    variance_vs_prior_forecast_pct DECIMAL(5,2) COMMENT 'Change % from previous forecast',
-    created_at TIMESTAMP COMMENT 'Record creation timestamp',
-    updated_at TIMESTAMP COMMENT 'Last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Consolidated forecast results with version-over-version variance'
-""")
-
-print("✓ Created: gold.forecast_results_gold")
-
-# COMMAND ----------
-
-# Close KPIs
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS gold.close_kpi_gold (
-    period STRING COMMENT 'Fiscal period (YYYY-MM)',
-    kpi_name STRING COMMENT 'KPI name (e.g., Cycle Time, Timeliness Score)',
-    kpi_category STRING COMMENT 'Category: efficiency, quality, compliance',
-    kpi_value DECIMAL(18,2) COMMENT 'KPI value',
-    kpi_unit STRING COMMENT 'Unit of measurement (days, %, count)',
-    target_value DECIMAL(18,2) COMMENT 'Target/SLA value',
-    bu_code STRING COMMENT 'Business unit code (NULL for group-level KPI)',
-    calculation_notes STRING COMMENT 'How KPI was calculated',
-    created_at TIMESTAMP COMMENT 'Record creation timestamp',
-    updated_at TIMESTAMP COMMENT 'Last update timestamp'
-  )
-  USING DELTA
-  COMMENT 'Key performance indicators for close process - quality and efficiency metrics'
-""")
-
-print("✓ Created: gold.close_kpi_gold")
+print("✓ Table bu_pre_close_raw created/verified")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Create Agent Logging Tables
+# MAGIC ### bu_segmented_raw - Segmented close files from BUs
 
 # COMMAND ----------
 
-# Agent activity log
-spark.sql("""
-  CREATE TABLE IF NOT EXISTS gold.close_agent_logs (
-    log_id STRING COMMENT 'Unique log entry identifier',
-    log_timestamp TIMESTAMP COMMENT 'When agent action occurred',
-    agent_name STRING COMMENT 'Agent that performed action',
-    action_type STRING COMMENT 'Type: status_update, validation, calculation, alert',
-    period STRING COMMENT 'Fiscal period context',
-    task_id INT COMMENT 'Related task_id (if applicable)',
-    bu_code STRING COMMENT 'Related BU (if applicable)',
-    decision_rationale STRING COMMENT 'Why agent took this action',
-    input_data STRING COMMENT 'Key input data (JSON)',
-    output_data STRING COMMENT 'Key output data (JSON)',
-    status STRING COMMENT 'Result: success, warning, error',
-    execution_time_ms INT COMMENT 'Execution time in milliseconds'
-  )
-  USING DELTA
-  COMMENT 'Audit log of all agent actions and decisions'
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {BRONZE_SCHEMA}.bu_segmented_raw (
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when file was loaded',
+  file_name STRING COMMENT 'Source file name',
+  period INT COMMENT 'Period in YYYYMM format',
+  bu STRING COMMENT 'Business unit code',
+  segment STRING COMMENT 'Business segment (Product A, Product B, Services, Other)',
+  product STRING COMMENT 'Product line',
+  region STRING COMMENT 'Geographic region',
+  revenue_local DECIMAL(18,2) COMMENT 'Revenue in local currency',
+  cogs_local DECIMAL(18,2) COMMENT 'Cost of goods sold in local currency',
+  opex_local DECIMAL(18,2) COMMENT 'Operating expenses in local currency',
+  local_currency STRING COMMENT 'Local currency code',
+  revenue_reporting DECIMAL(18,2) COMMENT 'Revenue in reporting currency',
+  cogs_reporting DECIMAL(18,2) COMMENT 'COGS in reporting currency',
+  opex_reporting DECIMAL(18,2) COMMENT 'Operating expenses in reporting currency',
+  reporting_currency STRING COMMENT 'Reporting currency code',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (period, bu)
+COMMENT 'Raw segmented close files with revenue and costs by segment, product, and region'
 """)
 
-print("✓ Created: gold.close_agent_logs")
+print("✓ Table bu_segmented_raw created/verified")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. Initialize Configuration Data
+# MAGIC ### bu_forecast_raw - Forecast files from BUs
 
 # COMMAND ----------
 
-from pyspark.sql import Row
-from datetime import datetime
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {BRONZE_SCHEMA}.bu_forecast_raw (
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when file was loaded',
+  file_name STRING COMMENT 'Source file name',
+  forecast_period INT COMMENT 'Period being forecasted in YYYYMM format',
+  submission_date DATE COMMENT 'Date when forecast was submitted',
+  bu STRING COMMENT 'Business unit code',
+  segment STRING COMMENT 'Business segment',
+  scenario STRING COMMENT 'Forecast scenario: Base, Upside, Downside',
+  revenue_local DECIMAL(18,2) COMMENT 'Forecasted revenue in local currency',
+  cogs_local DECIMAL(18,2) COMMENT 'Forecasted COGS in local currency',
+  opex_local DECIMAL(18,2) COMMENT 'Forecasted operating expenses in local currency',
+  local_currency STRING COMMENT 'Local currency code',
+  revenue_reporting DECIMAL(18,2) COMMENT 'Forecasted revenue in reporting currency',
+  cogs_reporting DECIMAL(18,2) COMMENT 'Forecasted COGS in reporting currency',
+  opex_reporting DECIMAL(18,2) COMMENT 'Forecasted operating expenses in reporting currency',
+  reporting_currency STRING COMMENT 'Reporting currency code',
+  assumptions STRING COMMENT 'Key forecast assumptions in text format',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (forecast_period, bu)
+COMMENT 'Raw forecast files submitted by business units with multiple scenarios'
+""")
 
-# Insert business units
-bus = [
-    Row(bu_code="NA", bu_name="North America", region="Americas", 
-        functional_currency="USD", reporting_currency="USD", is_active=True,
-        created_at=datetime.now(), updated_at=datetime.now()),
-    Row(bu_code="EU", bu_name="Europe", region="EMEA", 
-        functional_currency="EUR", reporting_currency="USD", is_active=True,
-        created_at=datetime.now(), updated_at=datetime.now()),
-    Row(bu_code="UK", bu_name="United Kingdom", region="EMEA", 
-        functional_currency="GBP", reporting_currency="USD", is_active=True,
-        created_at=datetime.now(), updated_at=datetime.now()),
-    Row(bu_code="ASIA", bu_name="Asia Pacific", region="APAC", 
-        functional_currency="CNY", reporting_currency="USD", is_active=True,
-        created_at=datetime.now(), updated_at=datetime.now()),
-    Row(bu_code="LATAM", bu_name="Latin America", region="Americas", 
-        functional_currency="BRL", reporting_currency="USD", is_active=True,
-        created_at=datetime.now(), updated_at=datetime.now()),
-    Row(bu_code="INDIA", bu_name="India", region="APAC", 
-        functional_currency="INR", reporting_currency="USD", is_active=True,
-        created_at=datetime.now(), updated_at=datetime.now())
-]
-
-spark.createDataFrame(bus).write.mode("overwrite").saveAsTable("config.business_units")
-print("✓ Inserted 6 business units")
-
-# COMMAND ----------
-
-# Insert close phase definitions
-phases_tasks = [
-    # Phase 1: Data Gathering
-    (1, "Data Gathering", "Initial data collection for the close", 2, 101, "Receive exchange rates", "Upload FX rates to system", "Tech", False, [], datetime.now()),
-    (1, "Data Gathering", "Initial data collection for the close", 2, 102, "Process exchange rates", "Validate and standardize FX rates", "Tech", False, [101], datetime.now()),
-    (1, "Data Gathering", "Initial data collection for the close", 2, 103, "Receive BU preliminary files", "BUs submit preliminary trial balance", "FP&A", True, [], datetime.now()),
-    
-    # Phase 2: Adjustments
-    (2, "Adjustments", "Process preliminary results and accounting cuts", 5, 201, "Process preliminary close", "Standardize and convert BU files", "Tech", False, [103], datetime.now()),
-    (2, "Adjustments", "Process preliminary results and accounting cuts", 5, 202, "Publish preliminary results", "Make results available for review", "FP&A", False, [201], datetime.now()),
-    (2, "Adjustments", "Process preliminary results and accounting cuts", 5, 203, "Preliminary review meeting", "FP&A and Tech review preliminary results", "FP&A", False, [202], datetime.now()),
-    (2, "Adjustments", "Process preliminary results and accounting cuts", 5, 204, "Receive first accounting cut", "BUs submit first round of adjustments", "Accounting", True, [203], datetime.now()),
-    (2, "Adjustments", "Process preliminary results and accounting cuts", 5, 205, "Receive second/final accounting cut", "BUs submit final adjustments", "Accounting", True, [204], datetime.now()),
-    
-    # Phase 3: Data Gathering
-    (3, "Data Gathering", "Collect segmented and forecast data", 2, 301, "Receive segmented files", "BUs submit segmented P&L", "FP&A", True, [205], datetime.now()),
-    (3, "Data Gathering", "Collect segmented and forecast data", 2, 302, "Receive forecast files", "BUs submit updated forecasts", "FP&A", True, [205], datetime.now()),
-    (3, "Data Gathering", "Collect segmented and forecast data", 2, 303, "Receive forecast FX rates", "Upload forecast FX curves", "Tech", False, [205], datetime.now()),
-    
-    # Phase 4: Review
-    (4, "Review", "Review segmented and forecast data", 2, 401, "Segmented close review meeting", "Review segment-level results", "FP&A", False, [301], datetime.now()),
-    (4, "Review", "Review segmented and forecast data", 2, 402, "Forecast review meeting", "Review forecast vs actuals", "FP&A", False, [302, 303], datetime.now()),
-    
-    # Phase 5: Reporting & Sign-off
-    (5, "Reporting & Sign-off", "Final publication and sign-off", 1, 501, "Publish final results", "Publish consolidated close package", "FP&A", False, [401, 402], datetime.now())
-]
-
-phase_df = spark.createDataFrame(phases_tasks, 
-    ["phase_id", "phase_name", "phase_description", "typical_duration_days", 
-     "task_id", "task_name", "task_description", "owner_role", "is_bu_specific", 
-     "depends_on_tasks", "created_at"])
-
-phase_df.write.mode("overwrite").saveAsTable("config.close_phase_definitions")
-print("✓ Inserted 14 close tasks across 5 phases")
-
-# COMMAND ----------
-
-# Insert agent configuration
-import json
-
-agents = [
-    Row(agent_name="close_supervisor", agent_type="orchestrator", is_enabled=True,
-        run_frequency="hourly", 
-        config_json=json.dumps({"check_interval_minutes": 60, "auto_transition": True}),
-        last_run_timestamp=None, created_at=datetime.now(), updated_at=datetime.now()),
-    
-    Row(agent_name="fx_agent", agent_type="domain", is_enabled=True,
-        run_frequency="hourly",
-        config_json=json.dumps({"required_currencies": ["EUR", "GBP", "BRL", "INR", "CNY"], "quality_threshold": 0.95}),
-        last_run_timestamp=None, created_at=datetime.now(), updated_at=datetime.now()),
-    
-    Row(agent_name="pre_close_agent", agent_type="domain", is_enabled=True,
-        run_frequency="daily",
-        config_json=json.dumps({"variance_threshold_pct": 10.0, "auto_flag_outliers": True}),
-        last_run_timestamp=None, created_at=datetime.now(), updated_at=datetime.now()),
-    
-    Row(agent_name="segmented_forecast_agent", agent_type="domain", is_enabled=True,
-        run_frequency="daily",
-        config_json=json.dumps({"reconciliation_tolerance": 0.01}),
-        last_run_timestamp=None, created_at=datetime.now(), updated_at=datetime.now()),
-    
-    Row(agent_name="reporting_agent", agent_type="reporting", is_enabled=True,
-        run_frequency="on_demand",
-        config_json=json.dumps({"generate_executive_summary": True, "auto_refresh_dashboards": True}),
-        last_run_timestamp=None, created_at=datetime.now(), updated_at=datetime.now())
-]
-
-spark.createDataFrame(agents).write.mode("overwrite").saveAsTable("config.agent_configuration")
-print("✓ Inserted 5 agent configurations")
+print("✓ Table bu_forecast_raw created/verified")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 8. Verification and Summary
+# MAGIC ### fx_forecast_raw - Forecast FX rates
 
 # COMMAND ----------
 
-# Verify all tables were created
-tables = spark.sql("""
-  SELECT table_schema, table_name, comment 
-  FROM financial_close_lakehouse.information_schema.tables 
-  WHERE table_schema IN ('bronze', 'silver', 'gold', 'config')
-  ORDER BY table_schema, table_name
-""").toPandas()
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {BRONZE_SCHEMA}.fx_forecast_raw (
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when file was loaded',
+  file_name STRING COMMENT 'Source file name',
+  forecast_period INT COMMENT 'Period being forecasted in YYYYMM format',
+  from_currency STRING COMMENT 'Source currency code',
+  to_currency STRING COMMENT 'Target currency code',
+  exchange_rate DECIMAL(18,6) COMMENT 'Forecasted exchange rate',
+  scenario STRING COMMENT 'FX scenario: Base, Upside, Downside',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (forecast_period)
+COMMENT 'Forecasted foreign exchange rates for future periods'
+""")
 
-print("\n" + "="*80)
-print("LAKEHOUSE SETUP COMPLETE")
-print("="*80)
-print(f"\nTotal tables created: {len(tables)}")
-print("\nBreakdown by layer:")
-print(tables.groupby('table_schema').size())
-
-# COMMAND ----------
-
-# Display table summary
-display(tables)
+print("✓ Table fx_forecast_raw created/verified")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## ✅ Setup Complete
-# MAGIC 
-# MAGIC **Next Steps:**
-# MAGIC 1. Run `02_synthetic_data_generation.py` to populate Bronze tables
-# MAGIC 2. Verify tables are ready for Genie by checking Unity Catalog UI
-# MAGIC 3. Grant appropriate permissions to FP&A users
-# MAGIC 
-# MAGIC **Key Tables for Genie:**
-# MAGIC - `gold.close_status_gold` - Close progress tracking
-# MAGIC - `gold.close_results_gold` - Final results and variances
-# MAGIC - `gold.forecast_results_gold` - Forecast analysis
-# MAGIC - `gold.close_kpi_gold` - KPIs and metrics
+# MAGIC ## Silver Layer Tables
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### fx_rates_std - Standardized FX rates
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {SILVER_SCHEMA}.fx_rates_std (
+  rate_date DATE COMMENT 'Date for which the FX rate is valid',
+  from_currency STRING COMMENT 'Source currency code',
+  to_currency STRING COMMENT 'Target currency code',
+  exchange_rate DECIMAL(18,6) COMMENT 'Standardized exchange rate',
+  rate_type STRING COMMENT 'Rate type: spot, average, month-end',
+  is_latest BOOLEAN COMMENT 'Flag indicating if this is the most recent rate for the date',
+  provider STRING COMMENT 'Primary FX rate provider',
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when standardized',
+  data_quality_score DECIMAL(3,2) COMMENT 'Data quality score (0-1)',
+  anomaly_flag BOOLEAN COMMENT 'Flag for unusual rate movements',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (rate_date)
+COMMENT 'Standardized and validated foreign exchange rates with quality flags'
+""")
+
+print("✓ Table fx_rates_std created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### close_trial_balance_std - Standardized trial balance
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {SILVER_SCHEMA}.close_trial_balance_std (
+  period INT COMMENT 'Period in YYYYMM format',
+  bu STRING COMMENT 'Business unit code',
+  cut_type STRING COMMENT 'preliminary, first_cut, or final_cut',
+  cut_version INT COMMENT 'Version number within cut type',
+  account_code STRING COMMENT 'Standardized GL account code',
+  account_name STRING COMMENT 'Standardized GL account description',
+  account_category STRING COMMENT 'P&L category: Revenue, COGS, Operating Expense, Other',
+  cost_center STRING COMMENT 'Cost center code',
+  segment STRING COMMENT 'Business segment',
+  region STRING COMMENT 'Geographic region',
+  local_currency STRING COMMENT 'Local currency code',
+  local_amount DECIMAL(18,2) COMMENT 'Amount in local currency',
+  reporting_currency STRING COMMENT 'Reporting currency code',
+  reporting_amount DECIMAL(18,2) COMMENT 'Amount in reporting currency',
+  fx_rate DECIMAL(18,6) COMMENT 'FX rate used for conversion',
+  fx_impact DECIMAL(18,2) COMMENT 'FX impact vs. prior period rate',
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when standardized',
+  data_quality_flag STRING COMMENT 'Data quality indicator: PASS, WARN, FAIL',
+  variance_vs_prior_pct DECIMAL(10,2) COMMENT 'Variance vs. prior period (%)',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (period, bu)
+COMMENT 'Standardized trial balance with all versions and cuts for financial close'
+""")
+
+print("✓ Table close_trial_balance_std created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### segmented_close_std - Standardized segmented close
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {SILVER_SCHEMA}.segmented_close_std (
+  period INT COMMENT 'Period in YYYYMM format',
+  bu STRING COMMENT 'Business unit code',
+  segment STRING COMMENT 'Business segment',
+  product STRING COMMENT 'Product line',
+  region STRING COMMENT 'Geographic region',
+  local_currency STRING COMMENT 'Local currency code',
+  reporting_currency STRING COMMENT 'Reporting currency code',
+  revenue_local DECIMAL(18,2) COMMENT 'Revenue in local currency',
+  cogs_local DECIMAL(18,2) COMMENT 'COGS in local currency',
+  opex_local DECIMAL(18,2) COMMENT 'Operating expenses in local currency',
+  operating_profit_local DECIMAL(18,2) COMMENT 'Operating profit in local currency',
+  revenue_reporting DECIMAL(18,2) COMMENT 'Revenue in reporting currency',
+  cogs_reporting DECIMAL(18,2) COMMENT 'COGS in reporting currency',
+  opex_reporting DECIMAL(18,2) COMMENT 'Operating expenses in reporting currency',
+  operating_profit_reporting DECIMAL(18,2) COMMENT 'Operating profit in reporting currency',
+  fx_impact_reporting DECIMAL(18,2) COMMENT 'FX impact on operating profit',
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when standardized',
+  data_quality_flag STRING COMMENT 'Data quality indicator',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (period, bu)
+COMMENT 'Standardized segmented close with P&L by segment, product, and region'
+""")
+
+print("✓ Table segmented_close_std created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### forecast_std - Standardized forecast
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {SILVER_SCHEMA}.forecast_std (
+  forecast_period INT COMMENT 'Period being forecasted in YYYYMM format',
+  submission_date DATE COMMENT 'Date when forecast was submitted',
+  bu STRING COMMENT 'Business unit code',
+  segment STRING COMMENT 'Business segment',
+  scenario STRING COMMENT 'Forecast scenario: Base, Upside, Downside',
+  local_currency STRING COMMENT 'Local currency code',
+  reporting_currency STRING COMMENT 'Reporting currency code',
+  revenue_local DECIMAL(18,2) COMMENT 'Forecasted revenue in local currency',
+  cogs_local DECIMAL(18,2) COMMENT 'Forecasted COGS in local currency',
+  opex_local DECIMAL(18,2) COMMENT 'Forecasted operating expenses in local currency',
+  operating_profit_local DECIMAL(18,2) COMMENT 'Forecasted operating profit in local currency',
+  revenue_reporting DECIMAL(18,2) COMMENT 'Forecasted revenue in reporting currency',
+  cogs_reporting DECIMAL(18,2) COMMENT 'Forecasted COGS in reporting currency',
+  opex_reporting DECIMAL(18,2) COMMENT 'Forecasted operating expenses in reporting currency',
+  operating_profit_reporting DECIMAL(18,2) COMMENT 'Forecasted operating profit in reporting currency',
+  fx_rate DECIMAL(18,6) COMMENT 'FX rate used for forecast conversion',
+  assumptions STRING COMMENT 'Key forecast assumptions',
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when standardized',
+  data_quality_flag STRING COMMENT 'Data quality indicator',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (forecast_period, bu)
+COMMENT 'Standardized forecast data with multiple scenarios and assumptions'
+""")
+
+print("✓ Table forecast_std created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Gold Layer Tables
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### close_phase_tasks - Task tracking for close phases
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {GOLD_SCHEMA}.close_phase_tasks (
+  period INT COMMENT 'Period in YYYYMM format',
+  phase_id INT COMMENT 'Phase number (1-5)',
+  phase_name STRING COMMENT 'Phase name (Data Gathering, Adjustments, etc.)',
+  task_id STRING COMMENT 'Unique task identifier',
+  task_name STRING COMMENT 'Task description',
+  bu STRING COMMENT 'Business unit (if task is BU-specific)',
+  owner_role STRING COMMENT 'Role responsible (FP&A, BU Controller, Tech)',
+  planned_due_date TIMESTAMP COMMENT 'Planned completion date/time',
+  actual_start_timestamp TIMESTAMP COMMENT 'Actual start timestamp',
+  actual_completion_timestamp TIMESTAMP COMMENT 'Actual completion timestamp',
+  status STRING COMMENT 'Task status: pending, in_progress, completed, blocked, cancelled',
+  blocking_reason STRING COMMENT 'Reason if status is blocked',
+  comments STRING COMMENT 'Free-text comments and notes',
+  agent_assigned STRING COMMENT 'Agent handling this task (if automated)',
+  priority STRING COMMENT 'Task priority: low, medium, high, critical',
+  dependencies STRING COMMENT 'Comma-separated list of task_ids this task depends on',
+  last_updated_timestamp TIMESTAMP COMMENT 'Last status update timestamp',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (period)
+COMMENT 'Task tracking for all financial close phases and activities'
+""")
+
+print("✓ Table close_phase_tasks created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### close_status_gold - Overall close status
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {GOLD_SCHEMA}.close_status_gold (
+  period INT COMMENT 'Period in YYYYMM format',
+  bu STRING COMMENT 'Business unit code (or CONSOLIDATED for overall)',
+  phase_id INT COMMENT 'Current phase number',
+  phase_name STRING COMMENT 'Current phase name',
+  overall_status STRING COMMENT 'Overall status: not_started, in_progress, completed, issues',
+  pct_tasks_completed DECIMAL(5,2) COMMENT 'Percentage of tasks completed',
+  total_tasks INT COMMENT 'Total number of tasks',
+  completed_tasks INT COMMENT 'Number of completed tasks',
+  blocked_tasks INT COMMENT 'Number of blocked tasks',
+  days_since_period_end INT COMMENT 'Days elapsed since period end',
+  days_to_sla INT COMMENT 'Days remaining to SLA target',
+  sla_status STRING COMMENT 'SLA status: on_track, at_risk, overdue',
+  key_issues STRING COMMENT 'Summary of key issues or blockers',
+  last_milestone STRING COMMENT 'Last completed milestone',
+  next_milestone STRING COMMENT 'Next milestone due',
+  agent_summary STRING COMMENT 'Summary generated by agents',
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when updated',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (period)
+COMMENT 'High-level close status and progress tracking by BU and period'
+""")
+
+print("✓ Table close_status_gold created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### close_results_gold - Final close results
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {GOLD_SCHEMA}.close_results_gold (
+  period INT COMMENT 'Period in YYYYMM format',
+  bu STRING COMMENT 'Business unit code (or CONSOLIDATED)',
+  segment STRING COMMENT 'Business segment (or ALL for BU total)',
+  product STRING COMMENT 'Product line (or ALL)',
+  region STRING COMMENT 'Geographic region (or ALL)',
+  local_currency STRING COMMENT 'Local currency code',
+  reporting_currency STRING COMMENT 'Reporting currency code',
+  revenue_local DECIMAL(18,2) COMMENT 'Revenue in local currency',
+  cogs_local DECIMAL(18,2) COMMENT 'COGS in local currency',
+  gross_profit_local DECIMAL(18,2) COMMENT 'Gross profit in local currency',
+  opex_local DECIMAL(18,2) COMMENT 'Operating expenses in local currency',
+  operating_profit_local DECIMAL(18,2) COMMENT 'Operating profit in local currency',
+  revenue_reporting DECIMAL(18,2) COMMENT 'Revenue in reporting currency',
+  cogs_reporting DECIMAL(18,2) COMMENT 'COGS in reporting currency',
+  gross_profit_reporting DECIMAL(18,2) COMMENT 'Gross profit in reporting currency',
+  opex_reporting DECIMAL(18,2) COMMENT 'Operating expenses in reporting currency',
+  operating_profit_reporting DECIMAL(18,2) COMMENT 'Operating profit in reporting currency',
+  fx_impact_reporting DECIMAL(18,2) COMMENT 'FX impact on operating profit vs. prior period',
+  variance_vs_prior_period DECIMAL(18,2) COMMENT 'Variance vs. prior period (reporting currency)',
+  variance_vs_prior_pct DECIMAL(10,2) COMMENT 'Variance vs. prior period (%)',
+  variance_vs_forecast DECIMAL(18,2) COMMENT 'Variance vs. forecast (reporting currency)',
+  variance_vs_forecast_pct DECIMAL(10,2) COMMENT 'Variance vs. forecast (%)',
+  gross_margin_pct DECIMAL(10,2) COMMENT 'Gross margin percentage',
+  operating_margin_pct DECIMAL(10,2) COMMENT 'Operating margin percentage',
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when finalized',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (period)
+COMMENT 'Final financial close results with segmentation and variance analysis'
+""")
+
+print("✓ Table close_results_gold created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### forecast_results_gold - Forecast results and variance
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {GOLD_SCHEMA}.forecast_results_gold (
+  forecast_period INT COMMENT 'Period being forecasted in YYYYMM format',
+  submission_date DATE COMMENT 'Forecast submission date',
+  bu STRING COMMENT 'Business unit code (or CONSOLIDATED)',
+  segment STRING COMMENT 'Business segment (or ALL)',
+  scenario STRING COMMENT 'Forecast scenario: Base, Upside, Downside',
+  local_currency STRING COMMENT 'Local currency code',
+  reporting_currency STRING COMMENT 'Reporting currency code',
+  revenue_forecast_local DECIMAL(18,2) COMMENT 'Forecasted revenue in local currency',
+  cogs_forecast_local DECIMAL(18,2) COMMENT 'Forecasted COGS in local currency',
+  opex_forecast_local DECIMAL(18,2) COMMENT 'Forecasted operating expenses in local currency',
+  operating_profit_forecast_local DECIMAL(18,2) COMMENT 'Forecasted operating profit in local currency',
+  revenue_forecast_reporting DECIMAL(18,2) COMMENT 'Forecasted revenue in reporting currency',
+  cogs_forecast_reporting DECIMAL(18,2) COMMENT 'Forecasted COGS in reporting currency',
+  opex_forecast_reporting DECIMAL(18,2) COMMENT 'Forecasted operating expenses in reporting currency',
+  operating_profit_forecast_reporting DECIMAL(18,2) COMMENT 'Forecasted operating profit in reporting currency',
+  revenue_actual_reporting DECIMAL(18,2) COMMENT 'Actual revenue (if period closed)',
+  operating_profit_actual_reporting DECIMAL(18,2) COMMENT 'Actual operating profit (if period closed)',
+  variance_revenue DECIMAL(18,2) COMMENT 'Variance: Actual - Forecast revenue',
+  variance_operating_profit DECIMAL(18,2) COMMENT 'Variance: Actual - Forecast operating profit',
+  variance_revenue_pct DECIMAL(10,2) COMMENT 'Revenue variance percentage',
+  variance_operating_profit_pct DECIMAL(10,2) COMMENT 'Operating profit variance percentage',
+  forecast_accuracy_score DECIMAL(5,2) COMMENT 'Forecast accuracy score (if actuals available)',
+  assumptions STRING COMMENT 'Key forecast assumptions',
+  variance_drivers STRING COMMENT 'Key drivers of variance (if actuals available)',
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when finalized',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (forecast_period)
+COMMENT 'Forecast results with variance analysis vs. actuals when available'
+""")
+
+print("✓ Table forecast_results_gold created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### close_kpi_gold - Close process KPIs
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {GOLD_SCHEMA}.close_kpi_gold (
+  period INT COMMENT 'Period in YYYYMM format',
+  kpi_name STRING COMMENT 'KPI name',
+  kpi_category STRING COMMENT 'KPI category: Timeliness, Quality, Efficiency, Financial',
+  bu STRING COMMENT 'Business unit (or CONSOLIDATED)',
+  kpi_value DECIMAL(18,2) COMMENT 'KPI numeric value',
+  kpi_unit STRING COMMENT 'KPI unit: days, count, percentage, currency',
+  target_value DECIMAL(18,2) COMMENT 'Target value for this KPI',
+  variance_vs_target DECIMAL(18,2) COMMENT 'Variance vs. target',
+  status STRING COMMENT 'KPI status: on_target, warning, critical',
+  trend STRING COMMENT 'Trend vs. prior periods: improving, stable, declining',
+  description STRING COMMENT 'KPI description and calculation method',
+  load_timestamp TIMESTAMP COMMENT 'Timestamp when calculated',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (period)
+COMMENT 'Key performance indicators for the financial close process'
+""")
+
+print("✓ Table close_kpi_gold created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### close_agent_logs - Agent activity logs
+
+# COMMAND ----------
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {GOLD_SCHEMA}.close_agent_logs (
+  log_timestamp TIMESTAMP COMMENT 'Timestamp of agent action',
+  period INT COMMENT 'Period in YYYYMM format (if applicable)',
+  agent_name STRING COMMENT 'Name of the agent: Orchestrator, FX, PreClose, Segmented, Reporting',
+  action STRING COMMENT 'Action performed by agent',
+  target_table STRING COMMENT 'Target table affected',
+  target_record_key STRING COMMENT 'Key of record(s) affected',
+  status STRING COMMENT 'Action status: success, warning, error',
+  message STRING COMMENT 'Log message or error description',
+  execution_time_ms LONG COMMENT 'Execution time in milliseconds',
+  user_context STRING COMMENT 'User or system context triggering action',
+  metadata STRING COMMENT 'Additional metadata in JSON format'
+)
+USING DELTA
+PARTITIONED BY (DATE(log_timestamp))
+COMMENT 'Audit log of all agent actions and automation activities'
+""")
+
+print("✓ Table close_agent_logs created/verified")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Optimize Tables
+
+# COMMAND ----------
+
+# Optimize Gold tables for query performance
+print("Optimizing Gold tables for query performance...")
+
+spark.sql(f"OPTIMIZE {GOLD_SCHEMA}.close_phase_tasks ZORDER BY (period, phase_id, status)")
+spark.sql(f"OPTIMIZE {GOLD_SCHEMA}.close_status_gold ZORDER BY (period, bu, phase_id)")
+spark.sql(f"OPTIMIZE {GOLD_SCHEMA}.close_results_gold ZORDER BY (period, bu, segment)")
+spark.sql(f"OPTIMIZE {GOLD_SCHEMA}.forecast_results_gold ZORDER BY (forecast_period, bu, scenario)")
+spark.sql(f"OPTIMIZE {GOLD_SCHEMA}.close_kpi_gold ZORDER BY (period, kpi_category)")
+
+print("✓ Tables optimized")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Grant Permissions (Optional)
+
+# COMMAND ----------
+
+# Example permission grants - adjust based on your organization's needs
+# Uncomment and modify as needed
+
+# # FP&A group: read access to all layers, write to Gold via agents only
+# spark.sql(f"GRANT SELECT ON SCHEMA {CATALOG}.{BRONZE_SCHEMA} TO `fpa_users`")
+# spark.sql(f"GRANT SELECT ON SCHEMA {CATALOG}.{SILVER_SCHEMA} TO `fpa_users`")
+# spark.sql(f"GRANT SELECT ON SCHEMA {CATALOG}.{GOLD_SCHEMA} TO `fpa_users`")
+# 
+# # BU Controllers: read access to their own BU data
+# spark.sql(f"GRANT SELECT ON SCHEMA {CATALOG}.{GOLD_SCHEMA} TO `bu_controllers`")
+# 
+# # Leadership: read access to Gold only
+# spark.sql(f"GRANT SELECT ON SCHEMA {CATALOG}.{GOLD_SCHEMA} TO `leadership`")
+# 
+# # Agents service principal: full access
+# spark.sql(f"GRANT ALL PRIVILEGES ON CATALOG {CATALOG} TO `agents_service_principal`")
+
+print("✓ Permissions configured (modify grants as needed)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Verify Setup
+
+# COMMAND ----------
+
+# List all tables
+print("\n=== Bronze Layer Tables ===")
+display(spark.sql(f"SHOW TABLES IN {BRONZE_SCHEMA}"))
+
+print("\n=== Silver Layer Tables ===")
+display(spark.sql(f"SHOW TABLES IN {SILVER_SCHEMA}"))
+
+print("\n=== Gold Layer Tables ===")
+display(spark.sql(f"SHOW TABLES IN {GOLD_SCHEMA}"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print("""
+✓ Setup Complete!
+
+Created:
+- Catalog: financial_close_catalog
+- Schemas: bronze_layer, silver_layer, gold_layer
+- 5 Bronze tables (raw landing)
+- 4 Silver tables (standardized)
+- 6 Gold tables (consumption-ready)
+
+Next Steps:
+1. Run notebook 02_synthetic_data_generation.py to generate test data
+2. Configure Databricks workflows for automation
+3. Set up Genie space with Gold tables
+
+For production use:
+- Adjust CATALOG_LOCATION to your ADLS Gen2 path
+- Configure Unity Catalog permissions for user groups
+- Set up monitoring and alerting
+""")

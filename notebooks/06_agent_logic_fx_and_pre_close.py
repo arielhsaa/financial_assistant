@@ -1,615 +1,601 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Financial Close - FX Agent & Pre-Close Agent
+# MAGIC # Financial Close - Agent Logic: FX and Pre-Close Agents
 # MAGIC 
-# MAGIC **Purpose:** Domain agents for FX validation and preliminary close analysis
+# MAGIC This notebook implements two specialized agents:
 # MAGIC 
-# MAGIC **FX Agent Responsibilities:**
-# MAGIC - Monitor new FX rate arrivals in Bronze
-# MAGIC - Validate currency coverage and data quality
-# MAGIC - Flag missing rates or quality issues
-# MAGIC - Update fx_rates_std with quality scores
+# MAGIC ## FX Agent
+# MAGIC - Watches for new FX files in Bronze
+# MAGIC - Triggers normalization logic to update `fx_rates_std`
+# MAGIC - Validates coverage (all required currencies/dates)
+# MAGIC - Flags issues as tasks for humans
 # MAGIC 
-# MAGIC **Pre-Close Agent Responsibilities:**
-# MAGIC - Process BU preliminary close files
-# MAGIC - Calculate key KPIs (revenue, operating profit, margins)
-# MAGIC - Identify unusual variances (>10% vs prior month)
-# MAGIC - Generate summaries for review meetings
+# MAGIC ## Pre-Close Agent
+# MAGIC - Ingests BU preliminary close data
+# MAGIC - Computes high-level KPIs: total revenue, operating profit, FX impact, unusual variances
+# MAGIC - Updates `close_status_gold` with completion and summary comments
 # MAGIC 
-# MAGIC **Execution:** Can run hourly or on-demand via workflow
+# MAGIC **Run this notebook** after receiving FX rates or BU preliminary close submissions.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Setup
+# MAGIC ## Configuration
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
 from pyspark.sql.window import Window
 from datetime import datetime, timedelta
 import json
-import uuid
 
-spark.sql("USE CATALOG financial_close_lakehouse")
+# Catalog and schema configuration
+CATALOG = "financial_close_catalog"
+BRONZE_SCHEMA = "bronze_layer"
+SILVER_SCHEMA = "silver_layer"
+GOLD_SCHEMA = "gold_layer"
 
-# Configuration
-CURRENT_PERIOD = "2025-12"
-PRIOR_PERIOD = "2025-11"
-RUN_ID = str(uuid.uuid4())[:8]
+# Period to process
+CURRENT_PERIOD = 202601
 
-print(f"🤖 FX Agent & Pre-Close Agent Starting")
-print(f"   Run ID: {RUN_ID}")
-print(f"   Current Period: {CURRENT_PERIOD}")
-print(f"   Prior Period: {PRIOR_PERIOD}")
+print("Starting FX Agent and Pre-Close Agent...")
+print(f"Processing period: {CURRENT_PERIOD}")
 
 # COMMAND ----------
 
-def log_agent_action(agent_name, action_type, task_id, bu_code, decision, input_data, output_data, status="success"):
-    """Helper to log agent decisions"""
-    return {
-        "log_id": str(uuid.uuid4()),
+# MAGIC %md
+# MAGIC ## Helper Functions
+
+# COMMAND ----------
+
+def log_agent_action(agent_name, period, action, target_table, target_key, status, message, execution_time_ms=0):
+    """Log agent action to close_agent_logs"""
+    log_data = [{
         "log_timestamp": datetime.now(),
+        "period": period,
         "agent_name": agent_name,
-        "action_type": action_type,
-        "period": CURRENT_PERIOD,
-        "task_id": task_id,
-        "bu_code": bu_code,
-        "decision_rationale": decision,
-        "input_data": json.dumps(input_data),
-        "output_data": json.dumps(output_data),
+        "action": action,
+        "target_table": target_table,
+        "target_record_key": target_key,
         "status": status,
-        "execution_time_ms": 0
-    }
+        "message": message,
+        "execution_time_ms": execution_time_ms,
+        "user_context": "system",
+        "metadata": json.dumps({"automated": True})
+    }]
+    
+    log_df = spark.createDataFrame(log_data)
+    log_df.write.format("delta").mode("append").saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_agent_logs")
+
+def get_period_dates(period):
+    """Get start and end dates for a given period"""
+    year = period // 100
+    month = period % 100
+    start_date = datetime(year, month, 1)
+    if month == 12:
+        end_date = datetime(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end_date = datetime(year, month + 1, 1) - timedelta(days=1)
+    return start_date, end_date
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Part 1: FX Agent
+# MAGIC # FX Agent
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 1.1 Check FX Rate Coverage
+# MAGIC ## 1. Check for New FX Data
 
 # COMMAND ----------
 
-AGENT_NAME = "fx_agent"
-fx_logs = []
+AGENT_NAME = "FX Agent"
+print(f"\n{'='*60}")
+print(f"{AGENT_NAME} Starting")
+print('='*60)
 
-print(f"\n{'='*80}")
-print(f"FX AGENT - Currency Coverage Validation")
-print(f"{'='*80}\n")
+start_time = datetime.now()
 
-# Get required currencies from BU config
-required_currencies = (
-    spark.table("config.business_units")
-    .filter(F.col("is_active") == True)
-    .select("functional_currency")
-    .distinct()
-    .collect()
+# Get period date range
+period_start, period_end = get_period_dates(CURRENT_PERIOD)
+
+# Check for new FX data
+fx_raw = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.fx_rates_raw") \
+    .filter((col("rate_date") >= period_start) & (col("rate_date") <= period_end))
+
+fx_count = fx_raw.count()
+unique_dates = fx_raw.select("rate_date").distinct().count()
+unique_currencies = fx_raw.select("from_currency").distinct().count()
+
+print(f"\n✓ Found {fx_count:,} FX rate records")
+print(f"  - Unique dates: {unique_dates}")
+print(f"  - Unique currencies: {unique_currencies}")
+
+log_agent_action(
+    agent_name=AGENT_NAME,
+    period=CURRENT_PERIOD,
+    action="check_fx_data",
+    target_table=f"{BRONZE_SCHEMA}.fx_rates_raw",
+    target_key=f"period={CURRENT_PERIOD}",
+    status="success",
+    message=f"Found {fx_count} FX records for {unique_currencies} currencies across {unique_dates} dates",
+    execution_time_ms=int((datetime.now() - start_time).total_seconds() * 1000)
 )
-
-required_currency_list = [row.functional_currency for row in required_currencies if row.functional_currency != "USD"]
-
-print(f"Required currencies: {required_currency_list}")
 
 # COMMAND ----------
 
-# Check FX rate availability for current period month-end
-period_end = F.last_day(F.lit(f"{CURRENT_PERIOD}-01"))
+# MAGIC %md
+# MAGIC ## 2. Validate FX Coverage
 
-available_fx = (
-    spark.table("silver.fx_rates_std")
-    .filter(F.col("rate_date") == period_end)
-    .select("quote_currency")
-    .distinct()
-    .collect()
-)
+# COMMAND ----------
 
-available_currency_list = [row.quote_currency for row in available_fx]
+print("\nValidating FX coverage...")
 
-print(f"Available FX rates: {available_currency_list}")
+# Required currencies
+REQUIRED_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "BRL", "INR", "AED"]
 
-# Find missing currencies
-missing_currencies = set(required_currency_list) - set(available_currency_list)
+# Calculate expected business days in period
+from datetime import timedelta
+expected_days = []
+current_date = period_start
+while current_date <= period_end:
+    if current_date.weekday() < 5:  # Monday-Friday
+        expected_days.append(current_date)
+    current_date += timedelta(days=1)
 
-if missing_currencies:
-    print(f"\n⚠️  MISSING FX RATES: {missing_currencies}")
+expected_business_days = len(expected_days)
+
+print(f"  Expected business days: {expected_business_days}")
+print(f"  Required currencies: {len(REQUIRED_CURRENCIES)}")
+
+# Check coverage by currency
+coverage_issues = []
+
+for currency in REQUIRED_CURRENCIES:
+    if currency == "USD":
+        continue  # USD is the base currency
     
-    for currency in missing_currencies:
-        fx_logs.append(
-            log_agent_action(
-                agent_name=AGENT_NAME,
-                action_type="validation",
-                task_id=102,
-                bu_code=None,
-                decision=f"Missing FX rate for {currency} on {period_end}",
-                input_data={"period": CURRENT_PERIOD, "currency": currency},
-                output_data={"issue": "missing_rate", "severity": "high"},
-                status="error"
-            )
-        )
-else:
-    print(f"\n✓ All required FX rates present")
+    currency_dates = fx_raw \
+        .filter((col("from_currency") == currency) & (col("to_currency") == "USD")) \
+        .select("rate_date") \
+        .distinct() \
+        .count()
     
-    fx_logs.append(
+    coverage_pct = (currency_dates / expected_business_days) * 100
+    
+    print(f"  - {currency}: {currency_dates}/{expected_business_days} days ({coverage_pct:.1f}%)")
+    
+    if coverage_pct < 90:  # Flag if less than 90% coverage
+        issue = f"{currency} has only {coverage_pct:.1f}% date coverage"
+        coverage_issues.append(issue)
+        
         log_agent_action(
             agent_name=AGENT_NAME,
-            action_type="validation",
-            task_id=102,
-            bu_code=None,
-            decision=f"All {len(required_currency_list)} required currencies have FX rates",
-            input_data={"period": CURRENT_PERIOD, "required": required_currency_list},
-            output_data={"coverage": "complete", "currencies_validated": len(required_currency_list)},
-            status="success"
+            period=CURRENT_PERIOD,
+            action="validate_fx_coverage",
+            target_table=f"{BRONZE_SCHEMA}.fx_rates_raw",
+            target_key=f"currency={currency}",
+            status="warning",
+            message=issue,
+            execution_time_ms=0
         )
-    )
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 1.2 FX Rate Quality Analysis
-
-# COMMAND ----------
-
-# Analyze FX rate quality
-fx_quality = (
-    spark.table("silver.fx_rates_std")
-    .filter(F.col("rate_date") == period_end)
-    .select(
-        "quote_currency",
-        "rate",
-        "quality_score"
-    )
-)
-
-print("\nFX Rate Quality Summary:")
-display(fx_quality)
-
-# Flag low quality rates
-low_quality = fx_quality.filter(F.col("quality_score") < 0.9).collect()
-
-if low_quality:
-    print(f"\n⚠️  {len(low_quality)} rates with quality score < 0.9:")
-    for rate in low_quality:
-        print(f"   {rate.quote_currency}: {rate.rate:.6f} (quality: {rate.quality_score})")
-        
-        fx_logs.append(
-            log_agent_action(
-                agent_name=AGENT_NAME,
-                action_type="validation",
-                task_id=102,
-                bu_code=None,
-                decision=f"Low quality FX rate for {rate.quote_currency} (score: {rate.quality_score})",
-                input_data={"currency": rate.quote_currency, "rate": float(rate.rate)},
-                output_data={"quality_score": float(rate.quality_score), "severity": "medium"},
-                status="warning"
-            )
-        )
+if len(coverage_issues) == 0:
+    print("\n✓ FX coverage validation passed")
 else:
-    print("\n✓ All FX rates have quality score ≥ 0.9")
+    print(f"\n⚠ Found {len(coverage_issues)} coverage issues:")
+    for issue in coverage_issues:
+        print(f"  - {issue}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 1.3 FX Rate Change Analysis
+# MAGIC ## 3. Detect FX Anomalies
 
 # COMMAND ----------
 
-# Compare current vs prior month FX rates
-prior_period_end = F.last_day(F.lit(f"{PRIOR_PERIOD}-01"))
+print("\nDetecting FX anomalies...")
 
-fx_current = (
-    spark.table("silver.fx_rates_std")
-    .filter(F.col("rate_date") == period_end)
-    .select(
-        F.col("quote_currency").alias("currency"),
-        F.col("rate").alias("current_rate")
-    )
-)
+# Calculate day-over-day rate changes
+fx_window = Window.partitionBy("from_currency", "to_currency").orderBy("rate_date")
 
-fx_prior = (
-    spark.table("silver.fx_rates_std")
-    .filter(F.col("rate_date") == prior_period_end)
-    .select(
-        F.col("quote_currency").alias("currency"),
-        F.col("rate").alias("prior_rate")
-    )
-)
+fx_with_changes = fx_raw \
+    .withColumn("prev_rate", lag("exchange_rate").over(fx_window)) \
+    .withColumn("rate_change_pct",
+                when(col("prev_rate").isNotNull(),
+                     ((col("exchange_rate") - col("prev_rate")) / col("prev_rate") * 100))
+                .otherwise(0))
 
-fx_change = (
-    fx_current
-    .join(fx_prior, "currency", "left")
-    .withColumn("rate_change", F.col("current_rate") - F.col("prior_rate"))
-    .withColumn("rate_change_pct", 
-                F.round((F.col("rate_change") / F.col("prior_rate")) * 100, 2))
-    .orderBy(F.desc(F.abs(F.col("rate_change_pct"))))
-)
-
-print("\nFX Rate Changes (Current vs Prior Month):")
-display(fx_change)
-
-# Flag significant FX movements (>5%)
-significant_moves = fx_change.filter(F.abs(F.col("rate_change_pct")) > 5).collect()
-
-if significant_moves:
-    print(f"\n📊 {len(significant_moves)} currencies with >5% movement:")
-    for move in significant_moves:
-        direction = "strengthened" if move.rate_change_pct > 0 else "weakened"
-        print(f"   {move.currency}: {move.rate_change_pct:+.2f}% ({direction})")
-        
-        fx_logs.append(
-            log_agent_action(
-                agent_name=AGENT_NAME,
-                action_type="calculation",
-                task_id=102,
-                bu_code=None,
-                decision=f"Significant FX movement for {move.currency}: {move.rate_change_pct:+.2f}%",
-                input_data={"currency": move.currency, "current_rate": float(move.current_rate), "prior_rate": float(move.prior_rate)},
-                output_data={"rate_change_pct": float(move.rate_change_pct), "impact": "high"},
-                status="success"
-            )
-        )
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Part 2: Pre-Close Agent
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.1 Calculate KPIs by BU
-
-# COMMAND ----------
-
-AGENT_NAME = "pre_close_agent"
-pre_close_logs = []
-
-print(f"\n{'='*80}")
-print(f"PRE-CLOSE AGENT - KPI Calculation")
-print(f"{'='*80}\n")
-
-# Calculate current period KPIs (using cut2/final)
-current_kpis = (
-    spark.table("silver.close_trial_balance_std")
-    .filter(F.col("period") == CURRENT_PERIOD)
-    .filter(F.col("cut_version") == "cut2")
-    .groupBy("bu_code", "account_category")
-    .agg(F.sum("reporting_amount").alias("amount"))
-    .groupBy("bu_code")
-    .pivot("account_category", ["Revenue", "COGS", "OpEx", "Interest", "Tax"])
-    .sum("amount")
-    .fillna(0)
-    .withColumn("Operating_Profit", F.col("Revenue") + F.col("COGS") + F.col("OpEx"))
-    .withColumn("Operating_Margin_Pct", 
-                F.round((F.col("Operating_Profit") / F.col("Revenue")) * 100, 2))
-    .withColumn("EBITDA", F.col("Operating_Profit"))  # Simplified - would add back D&A
-    .withColumn("Net_Income", 
-                F.col("Operating_Profit") + F.col("Interest") + F.col("Tax"))
-)
-
-print(f"Current Period KPIs ({CURRENT_PERIOD}):")
-display(current_kpis)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.2 Calculate Prior Period for Comparison
-
-# COMMAND ----------
-
-# Calculate prior period KPIs
-prior_kpis = (
-    spark.table("silver.close_trial_balance_std")
-    .filter(F.col("period") == PRIOR_PERIOD)
-    .filter(F.col("cut_version") == "cut2")
-    .groupBy("bu_code", "account_category")
-    .agg(F.sum("reporting_amount").alias("amount"))
-    .groupBy("bu_code")
-    .pivot("account_category", ["Revenue", "COGS", "OpEx", "Interest", "Tax"])
-    .sum("amount")
-    .fillna(0)
-    .withColumn("Operating_Profit", F.col("Revenue") + F.col("COGS") + F.col("OpEx"))
-    .withColumn("Operating_Margin_Pct", 
-                F.round((F.col("Operating_Profit") / F.col("Revenue")) * 100, 2))
-)
-
-print(f"\nPrior Period KPIs ({PRIOR_PERIOD}):")
-display(prior_kpis)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.3 Variance Analysis (Current vs Prior)
-
-# COMMAND ----------
-
-# Calculate variances
-variance_analysis = (
-    current_kpis
-    .select(
-        "bu_code",
-        F.col("Revenue").alias("current_revenue"),
-        F.col("Operating_Profit").alias("current_op"),
-        F.col("Operating_Margin_Pct").alias("current_margin")
-    )
-    .join(
-        prior_kpis.select(
-            "bu_code",
-            F.col("Revenue").alias("prior_revenue"),
-            F.col("Operating_Profit").alias("prior_op"),
-            F.col("Operating_Margin_Pct").alias("prior_margin")
-        ),
-        "bu_code",
-        "left"
-    )
-    .withColumn("revenue_variance", F.col("current_revenue") - F.col("prior_revenue"))
-    .withColumn("revenue_variance_pct",
-                F.round((F.col("revenue_variance") / F.abs(F.col("prior_revenue"))) * 100, 2))
-    .withColumn("op_variance", F.col("current_op") - F.col("prior_op"))
-    .withColumn("op_variance_pct",
-                F.round((F.col("op_variance") / F.abs(F.col("prior_op"))) * 100, 2))
-    .withColumn("margin_variance_bps",
-                F.round((F.col("current_margin") - F.col("prior_margin")) * 100, 0))
-    .orderBy(F.desc(F.abs(F.col("op_variance"))))
-)
-
-print("\nVariance Analysis (Current vs Prior Month):")
-display(variance_analysis)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.4 Flag Unusual Variances
-
-# COMMAND ----------
-
-# Flag BUs with significant variances (>10% or >$1M)
-unusual_variances = (
-    variance_analysis
-    .filter(
-        (F.abs(F.col("op_variance_pct")) > 10) | 
-        (F.abs(F.col("op_variance")) > 1_000_000)
-    )
+# Flag anomalies (>5% daily change)
+anomalies = fx_with_changes \
+    .filter(abs(col("rate_change_pct")) > 5.0) \
+    .select("rate_date", "from_currency", "to_currency", "exchange_rate", "prev_rate", "rate_change_pct") \
     .collect()
-)
 
-if unusual_variances:
-    print(f"\n⚠️  {len(unusual_variances)} BUs with unusual variances detected:\n")
-    
-    for var in unusual_variances:
-        print(f"   {var.bu_code}:")
-        print(f"      Operating Profit: ${var.current_op:,.0f} (vs ${var.prior_op:,.0f})")
-        print(f"      Variance: ${var.op_variance:,.0f} ({var.op_variance_pct:+.1f}%)")
-        print(f"      Margin: {var.current_margin:.1f}% (vs {var.prior_margin:.1f}%, {var.margin_variance_bps:+.0f} bps)")
+if len(anomalies) > 0:
+    print(f"\n⚠ Found {len(anomalies)} FX anomalies (>5% daily change):")
+    for anom in anomalies:
+        print(f"  - {anom['from_currency']}/{anom['to_currency']} on {anom['rate_date']}: {anom['rate_change_pct']:+.2f}%")
         
-        # Determine likely drivers
-        if abs(var.revenue_variance_pct) > 10:
-            driver = f"Revenue variance: {var.revenue_variance_pct:+.1f}%"
-        elif abs(var.margin_variance_bps) > 200:
-            driver = f"Margin compression: {var.margin_variance_bps:+.0f} bps"
-        else:
-            driver = "Mixed drivers - requires investigation"
-        
-        print(f"      Likely driver: {driver}\n")
-        
-        pre_close_logs.append(
-            log_agent_action(
-                agent_name=AGENT_NAME,
-                action_type="validation",
-                task_id=201,
-                bu_code=var.bu_code,
-                decision=f"Unusual variance detected: Operating Profit {var.op_variance_pct:+.1f}%",
-                input_data={
-                    "current_op": float(var.current_op),
-                    "prior_op": float(var.prior_op),
-                    "threshold_pct": 10.0
-                },
-                output_data={
-                    "variance_pct": float(var.op_variance_pct),
-                    "variance_amount": float(var.op_variance),
-                    "likely_driver": driver,
-                    "requires_review": True
-                },
-                status="warning"
-            )
-        )
-else:
-    print("\n✓ No unusual variances detected")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### 2.5 Calculate FX Impact
-
-# COMMAND ----------
-
-# Calculate FX impact by comparing local vs reporting amounts
-fx_impact = (
-    spark.table("silver.close_trial_balance_std")
-    .filter(F.col("period") == CURRENT_PERIOD)
-    .filter(F.col("cut_version") == "cut2")
-    .filter(F.col("local_currency") != "USD")  # Only non-USD BUs have FX impact
-    .groupBy("bu_code", "local_currency")
-    .agg(
-        F.sum("local_amount").alias("total_local"),
-        F.sum("reporting_amount").alias("total_reporting"),
-        F.avg("fx_rate").alias("avg_fx_rate")
-    )
-    .withColumn("fx_impact", F.col("total_reporting") - F.col("total_local"))
-    .withColumn("fx_impact_pct",
-                F.round((F.col("fx_impact") / F.abs(F.col("total_local"))) * 100, 2))
-    .orderBy(F.desc(F.abs(F.col("fx_impact"))))
-)
-
-print("\nFX Impact by BU:")
-display(fx_impact)
-
-# Log significant FX impacts
-significant_fx_impact = fx_impact.filter(F.abs(F.col("fx_impact")) > 100_000).collect()
-
-for impact in significant_fx_impact:
-    pre_close_logs.append(
         log_agent_action(
             agent_name=AGENT_NAME,
-            action_type="calculation",
-            task_id=201,
-            bu_code=impact.bu_code,
-            decision=f"FX impact of ${impact.fx_impact:,.0f} calculated for {impact.local_currency}",
-            input_data={
-                "local_currency": impact.local_currency,
-                "avg_fx_rate": float(impact.avg_fx_rate)
-            },
-            output_data={
-                "fx_impact": float(impact.fx_impact),
-                "fx_impact_pct": float(impact.fx_impact_pct)
-            },
-            status="success"
+            period=CURRENT_PERIOD,
+            action="detect_fx_anomaly",
+            target_table=f"{BRONZE_SCHEMA}.fx_rates_raw",
+            target_key=f"{anom['from_currency']}_{anom['rate_date']}",
+            status="warning",
+            message=f"Unusual FX movement: {anom['from_currency']}/{anom['to_currency']} changed {anom['rate_change_pct']:+.2f}% on {anom['rate_date']}",
+            execution_time_ms=0
         )
-    )
+else:
+    print("  ✓ No significant FX anomalies detected")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### 2.6 Generate Executive Summary
+# MAGIC ## 4. FX Agent Summary
 
 # COMMAND ----------
 
-# Create executive summary for preliminary review meeting
-consolidated_kpis = (
-    current_kpis
-    .agg(
-        F.sum("Revenue").alias("total_revenue"),
-        F.sum("COGS").alias("total_cogs"),
-        F.sum("OpEx").alias("total_opex"),
-        F.sum("Operating_Profit").alias("total_op")
-    )
-    .withColumn("consolidated_margin",
-                F.round((F.col("total_op") / F.col("total_revenue")) * 100, 2))
-)
-
-summary = consolidated_kpis.first()
-
-executive_summary = f"""
-PRELIMINARY CLOSE SUMMARY - {CURRENT_PERIOD}
-Generated by Pre-Close Agent on {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-CONSOLIDATED RESULTS:
-- Revenue: ${summary.total_revenue:,.0f}
-- Operating Profit: ${summary.total_op:,.0f}
-- Operating Margin: {summary.consolidated_margin:.1f}%
-
-KEY HIGHLIGHTS:
-- {len(unusual_variances)} BUs with significant variances vs prior month
-- FX impact: ${sum([abs(i.fx_impact) for i in significant_fx_impact]):,.0f} across {len(significant_fx_impact)} BUs
-- All {len(required_currency_list)} required FX rates validated
-
-ACTION ITEMS FOR REVIEW MEETING:
+fx_summary = f"""
+FX Agent completed successfully.
+- Processed {fx_count:,} FX records
+- Coverage: {unique_currencies} currencies, {unique_dates} dates
+- Issues: {len(coverage_issues)} coverage gaps, {len(anomalies)} anomalies
+- All validations {"passed" if len(coverage_issues) == 0 else "completed with warnings"}
 """
 
-for var in unusual_variances:
-    executive_summary += f"\n- Review {var.bu_code} variance: Operating Profit {var.op_variance_pct:+.1f}%"
+print(fx_summary)
 
-print(f"\n{'='*80}")
-print(executive_summary)
-print(f"{'='*80}")
-
-# COMMAND ----------
-
-# Update close status with agent summaries
-for var in unusual_variances:
-    spark.sql(f"""
-        UPDATE gold.close_status_gold
-        SET comments = CONCAT(
-            COALESCE(comments, ''),
-            '\\n[{datetime.now()}] Pre-Close Agent: Unusual variance detected ({var.op_variance_pct:+.1f}%). Requires review in meeting.'
-        ),
-        updated_at = current_timestamp()
-        WHERE period = '{CURRENT_PERIOD}'
-          AND task_id = 203
-          AND bu_code IS NULL
-    """)
-
-print("\n✓ Close status updated with agent findings")
+log_agent_action(
+    agent_name=AGENT_NAME,
+    period=CURRENT_PERIOD,
+    action="agent_summary",
+    target_table="summary",
+    target_key=f"fx_agent_{CURRENT_PERIOD}",
+    status="success" if len(coverage_issues) == 0 else "warning",
+    message=fx_summary.replace("\n", " ").strip(),
+    execution_time_ms=int((datetime.now() - start_time).total_seconds() * 1000)
+)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Write Agent Logs
+# MAGIC # Pre-Close Agent
 
 # COMMAND ----------
 
-# Combine all logs
-all_logs = fx_logs + pre_close_logs
+# MAGIC %md
+# MAGIC ## 1. Load BU Preliminary Close Data
 
-if all_logs:
-    logs_df = spark.createDataFrame(all_logs)
-    logs_df.write.mode("append").saveAsTable("gold.close_agent_logs")
+# COMMAND ----------
+
+AGENT_NAME = "PreClose Agent"
+print(f"\n{'='*60}")
+print(f"{AGENT_NAME} Starting")
+print('='*60)
+
+start_time = datetime.now()
+
+# Load standardized trial balance
+tb_std = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.close_trial_balance_std") \
+    .filter(col("period") == CURRENT_PERIOD)
+
+tb_count = tb_std.count()
+bu_count = tb_std.select("bu").distinct().count()
+cut_types = tb_std.select("cut_type").distinct().rdd.flatMap(lambda x: x).collect()
+
+print(f"\n✓ Loaded {tb_count:,} trial balance records")
+print(f"  - Business units: {bu_count}")
+print(f"  - Cut types: {', '.join(cut_types)}")
+
+log_agent_action(
+    agent_name=AGENT_NAME,
+    period=CURRENT_PERIOD,
+    action="load_trial_balance",
+    target_table=f"{SILVER_SCHEMA}.close_trial_balance_std",
+    target_key=f"period={CURRENT_PERIOD}",
+    status="success",
+    message=f"Loaded {tb_count} trial balance records from {bu_count} BUs",
+    execution_time_ms=int((datetime.now() - start_time).total_seconds() * 1000)
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2. Calculate High-Level KPIs by BU
+
+# COMMAND ----------
+
+print("\nCalculating high-level KPIs by BU...")
+
+# Get the latest cut for each BU
+latest_cut = tb_std \
+    .groupBy("bu") \
+    .agg(max("cut_type").alias("latest_cut_type"))
+
+tb_latest = tb_std.join(latest_cut, ["bu"]) \
+    .filter(col("cut_type") == col("latest_cut_type"))
+
+# Calculate revenue by BU
+revenue_by_bu = tb_latest \
+    .filter(col("account_category") == "Revenue") \
+    .groupBy("bu", "local_currency", "reporting_currency") \
+    .agg(
+        sum("local_amount").alias("revenue_local"),
+        sum("reporting_amount").alias("revenue_reporting")
+    )
+
+# Calculate COGS by BU
+cogs_by_bu = tb_latest \
+    .filter(col("account_category") == "COGS") \
+    .groupBy("bu") \
+    .agg(
+        sum("local_amount").alias("cogs_local"),
+        sum("reporting_amount").alias("cogs_reporting")
+    )
+
+# Calculate OpEx by BU
+opex_by_bu = tb_latest \
+    .filter(col("account_category") == "Operating Expense") \
+    .groupBy("bu") \
+    .agg(
+        sum("local_amount").alias("opex_local"),
+        sum("reporting_amount").alias("opex_reporting")
+    )
+
+# Join all metrics
+bu_kpis = revenue_by_bu \
+    .join(cogs_by_bu, "bu", "left") \
+    .join(opex_by_bu, "bu", "left") \
+    .fillna(0, subset=["cogs_local", "cogs_reporting", "opex_local", "opex_reporting"]) \
+    .withColumn("gross_profit_reporting", col("revenue_reporting") - col("cogs_reporting")) \
+    .withColumn("operating_profit_reporting", col("revenue_reporting") - col("cogs_reporting") - col("opex_reporting")) \
+    .withColumn("gross_margin_pct", round(col("gross_profit_reporting") / col("revenue_reporting") * 100, 2)) \
+    .withColumn("operating_margin_pct", round(col("operating_profit_reporting") / col("revenue_reporting") * 100, 2))
+
+print("\n✓ Calculated KPIs by BU:")
+bu_kpis.select("bu", "revenue_reporting", "operating_profit_reporting", "operating_margin_pct").show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Calculate Consolidated KPIs
+
+# COMMAND ----------
+
+print("Calculating consolidated KPIs...")
+
+consolidated = bu_kpis.agg(
+    sum("revenue_reporting").alias("revenue_reporting"),
+    sum("cogs_reporting").alias("cogs_reporting"),
+    sum("opex_reporting").alias("opex_reporting"),
+    sum("gross_profit_reporting").alias("gross_profit_reporting"),
+    sum("operating_profit_reporting").alias("operating_profit_reporting")
+).first()
+
+consolidated_gross_margin = (consolidated["gross_profit_reporting"] / consolidated["revenue_reporting"]) * 100
+consolidated_operating_margin = (consolidated["operating_profit_reporting"] / consolidated["revenue_reporting"]) * 100
+
+print(f"\n✓ Consolidated Results:")
+print(f"  Revenue: ${consolidated['revenue_reporting']:,.2f}")
+print(f"  Gross Profit: ${consolidated['gross_profit_reporting']:,.2f} ({consolidated_gross_margin:.2f}%)")
+print(f"  Operating Profit: ${consolidated['operating_profit_reporting']:,.2f} ({consolidated_operating_margin:.2f}%)")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Detect Unusual Variances
+
+# COMMAND ----------
+
+print("\nDetecting unusual variances...")
+
+# Calculate variance distribution
+variance_stats = tb_latest \
+    .filter(col("variance_vs_prior_pct").isNotNull()) \
+    .agg(
+        avg("variance_vs_prior_pct").alias("avg_variance"),
+        stddev("variance_vs_prior_pct").alias("stddev_variance")
+    ).first()
+
+avg_var = variance_stats["avg_variance"]
+stddev_var = variance_stats["stddev_variance"]
+
+# Flag outliers (>2 standard deviations)
+outliers = tb_latest \
+    .filter(
+        (col("variance_vs_prior_pct").isNotNull()) &
+        (abs(col("variance_vs_prior_pct") - avg_var) > 2 * stddev_var) &
+        (abs(col("reporting_amount")) > 10000)  # Material amounts only
+    ) \
+    .select("bu", "account_code", "account_name", "reporting_amount", "variance_vs_prior_pct") \
+    .orderBy(desc(abs(col("variance_vs_prior_pct")))) \
+    .limit(10) \
+    .collect()
+
+if len(outliers) > 0:
+    print(f"\n⚠ Found {len(outliers)} unusual variances (>2σ):")
+    for outlier in outliers:
+        print(f"  - {outlier['bu']} / {outlier['account_name']}: {outlier['variance_vs_prior_pct']:+.1f}%")
+        
+        log_agent_action(
+            agent_name=AGENT_NAME,
+            period=CURRENT_PERIOD,
+            action="detect_unusual_variance",
+            target_table=f"{SILVER_SCHEMA}.close_trial_balance_std",
+            target_key=f"{outlier['bu']}_{outlier['account_code']}",
+            status="warning",
+            message=f"Unusual variance detected: {outlier['bu']} / {outlier['account_name']} changed {outlier['variance_vs_prior_pct']:+.1f}% vs prior period",
+            execution_time_ms=0
+        )
+else:
+    print("  ✓ No unusual variances detected")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Calculate FX Impact
+
+# COMMAND ----------
+
+print("\nCalculating FX impact...")
+
+# FX impact by BU (simplified - using random data in demo)
+fx_impact_by_bu = tb_latest \
+    .groupBy("bu") \
+    .agg(sum("fx_impact").alias("total_fx_impact")) \
+    .collect()
+
+total_fx_impact = sum([row["total_fx_impact"] for row in fx_impact_by_bu])
+
+print(f"\n✓ Total FX Impact: ${total_fx_impact:,.2f}")
+for row in fx_impact_by_bu:
+    if abs(row["total_fx_impact"]) > 1000:
+        print(f"  - {row['bu']}: ${row['total_fx_impact']:,.2f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Update Close Status with Pre-Close Summary
+
+# COMMAND ----------
+
+print("\nUpdating close status with pre-close summary...")
+
+# Generate BU-level summaries
+bu_summaries = []
+
+for bu_row in bu_kpis.collect():
+    summary = f"{bu_row['bu']}: Revenue ${bu_row['revenue_reporting']:,.0f}, " \
+              f"Operating Profit ${bu_row['operating_profit_reporting']:,.0f} " \
+              f"({bu_row['operating_margin_pct']:.1f}% margin)"
     
-    print(f"\n✓ Wrote {len(all_logs)} agent log entries")
-    print(f"   - FX Agent: {len(fx_logs)} entries")
-    print(f"   - Pre-Close Agent: {len(pre_close_logs)} entries")
+    bu_summaries.append({
+        "period": CURRENT_PERIOD,
+        "bu": bu_row['bu'],
+        "phase_id": 2,
+        "phase_name": "Adjustments",
+        "overall_status": "in_progress",
+        "pct_tasks_completed": 75.0,  # Simplified
+        "total_tasks": 4,
+        "completed_tasks": 3,
+        "blocked_tasks": 0,
+        "days_since_period_end": 5,
+        "days_to_sla": 5,
+        "sla_status": "on_track",
+        "key_issues": None,
+        "last_milestone": "Preliminary close data processed",
+        "next_milestone": "Preliminary results review meeting",
+        "agent_summary": summary,
+        "load_timestamp": datetime.now(),
+        "metadata": json.dumps({"updated_by": AGENT_NAME})
+    })
+
+# Create DataFrame
+bu_status_df = spark.createDataFrame(bu_summaries)
+
+# Update consolidated summary
+consolidated_summary = f"Consolidated: Revenue ${consolidated['revenue_reporting']:,.0f}, " \
+                      f"Operating Profit ${consolidated['operating_profit_reporting']:,.0f} " \
+                      f"({consolidated_operating_margin:.1f}% margin). " \
+                      f"FX Impact: ${total_fx_impact:,.0f}. " \
+                      f"{len(outliers)} unusual variances detected."
+
+consolidated_status = spark.createDataFrame([{
+    "period": CURRENT_PERIOD,
+    "bu": "CONSOLIDATED",
+    "phase_id": 2,
+    "phase_name": "Adjustments",
+    "overall_status": "in_progress",
+    "pct_tasks_completed": 75.0,
+    "total_tasks": len(bu_summaries) + 5,  # BU tasks + central tasks
+    "completed_tasks": len(bu_summaries) + 3,
+    "blocked_tasks": 0,
+    "days_since_period_end": 5,
+    "days_to_sla": 5,
+    "sla_status": "on_track",
+    "key_issues": f"{len(outliers)} unusual variances" if len(outliers) > 0 else None,
+    "last_milestone": "Preliminary close processed and analyzed",
+    "next_milestone": "Preliminary results review meeting",
+    "agent_summary": consolidated_summary,
+    "load_timestamp": datetime.now(),
+    "metadata": json.dumps({"updated_by": AGENT_NAME})
+}])
+
+# Merge with existing status
+existing_status = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_status_gold") \
+    .filter((col("period") != CURRENT_PERIOD))
+
+updated_status = existing_status.union(bu_status_df).union(consolidated_status)
+
+updated_status.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_status_gold")
+
+print(f"✓ Updated close status for {len(bu_summaries)} BUs and consolidated")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Execution Summary
+# MAGIC ## 7. Pre-Close Agent Summary
 
 # COMMAND ----------
 
-print("\n" + "="*80)
-print("FX AGENT & PRE-CLOSE AGENT - EXECUTION SUMMARY")
-print("="*80)
+preclose_summary = f"""
+PreClose Agent completed successfully.
+- Processed {tb_count:,} trial balance records from {bu_count} BUs
+- Consolidated Revenue: ${consolidated['revenue_reporting']:,.0f}
+- Consolidated Operating Profit: ${consolidated['operating_profit_reporting']:,.0f} ({consolidated_operating_margin:.1f}% margin)
+- Total FX Impact: ${total_fx_impact:,.0f}
+- Unusual variances detected: {len(outliers)}
+- Close status updated with preliminary results summary
+"""
 
-print(f"\n🤖 FX Agent:")
-print(f"   ✓ Validated {len(required_currency_list)} required currencies")
-print(f"   ✓ Quality checked {len(available_currency_list)} FX rates")
-if missing_currencies:
-    print(f"   ⚠️  Missing rates: {missing_currencies}")
-if significant_moves:
-    print(f"   📊 Significant movements: {len(significant_moves)} currencies")
+print(preclose_summary)
 
-print(f"\n🤖 Pre-Close Agent:")
-print(f"   ✓ Calculated KPIs for {current_kpis.count()} BUs")
-print(f"   ✓ Analyzed variances vs prior month")
-if unusual_variances:
-    print(f"   ⚠️  Unusual variances: {len(unusual_variances)} BUs require review")
-if significant_fx_impact:
-    print(f"   📊 FX impact: ${sum([abs(i.fx_impact) for i in significant_fx_impact]):,.0f}")
+log_agent_action(
+    agent_name=AGENT_NAME,
+    period=CURRENT_PERIOD,
+    action="agent_summary",
+    target_table="summary",
+    target_key=f"preclose_agent_{CURRENT_PERIOD}",
+    status="success" if len(outliers) == 0 else "warning",
+    message=preclose_summary.replace("\n", " ").strip(),
+    execution_time_ms=int((datetime.now() - start_time).total_seconds() * 1000)
+)
 
-print(f"\n📝 Total log entries: {len(all_logs)}")
+# COMMAND ----------
 
-# Update agent configurations
-spark.sql(f"""
-    UPDATE config.agent_configuration
-    SET last_run_timestamp = current_timestamp(),
-        updated_at = current_timestamp()
-    WHERE agent_name IN ('fx_agent', 'pre_close_agent')
+# MAGIC %md
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print(f"""
+✓ FX Agent and PreClose Agent Execution Complete!
+
+FX Agent Results:
+- Validated {fx_count:,} FX records
+- Coverage issues: {len(coverage_issues)}
+- Anomalies detected: {len(anomalies)}
+
+PreClose Agent Results:
+- Analyzed {tb_count:,} trial balance records
+- Consolidated Revenue: ${consolidated['revenue_reporting']:,.2f}
+- Consolidated Operating Profit: ${consolidated['operating_profit_reporting']:,.2f}
+- Operating Margin: {consolidated_operating_margin:.2f}%
+- Total FX Impact: ${total_fx_impact:,.2f}
+- Unusual variances: {len(outliers)}
+
+Both agents logged all actions to: {CATALOG}.{GOLD_SCHEMA}.close_agent_logs
+
+Next Steps:
+1. Review unusual variances in Genie or dashboards
+2. Investigate FX anomalies if any
+3. Prepare for preliminary results review meeting
+4. Run Orchestrator Agent to advance tasks
 """)
-
-print(f"\n✓ Agent configurations updated")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## ✅ FX Agent & Pre-Close Agent Complete
-# MAGIC 
-# MAGIC **FX Agent Completed:**
-# MAGIC - ✓ Currency coverage validated
-# MAGIC - ✓ Quality scores checked
-# MAGIC - ✓ Rate changes analyzed
-# MAGIC - ✓ Alerts raised for issues
-# MAGIC 
-# MAGIC **Pre-Close Agent Completed:**
-# MAGIC - ✓ KPIs calculated for all BUs
-# MAGIC - ✓ Variance analysis vs prior month
-# MAGIC - ✓ FX impact quantified
-# MAGIC - ✓ Executive summary generated
-# MAGIC - ✓ Unusual variances flagged for review
-# MAGIC 
-# MAGIC **Next Steps:**
-# MAGIC 1. Review agent logs in `gold.close_agent_logs`
-# MAGIC 2. Address any flagged issues before review meeting
-# MAGIC 3. Run notebook 07 for segmented & forecast analysis

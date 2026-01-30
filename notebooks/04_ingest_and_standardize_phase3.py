@@ -1,536 +1,630 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Financial Close - Phase 3 Data Processing
+# MAGIC # Financial Close - Phase 3 Data Ingestion and Standardization
 # MAGIC 
-# MAGIC **Purpose:** Ingest and standardize data for Phase 3 (Data Gathering - Segmented & Forecast)
+# MAGIC This notebook processes Bronze data for **Phase 3 (Data Gathering - Segmented & Forecast)**:
+# MAGIC - Standardizes segmented close to Silver (`segmented_close_std`)
+# MAGIC - Standardizes forecast to Silver (`forecast_std`)
+# MAGIC - Updates task tracking in Gold (`close_phase_tasks`)
+# MAGIC - Updates close status in Gold (`close_status_gold`)
 # MAGIC 
-# MAGIC **Processes:**
-# MAGIC - Segmented close data: Bronze → Silver (standardization, FX conversion, reconciliation)
-# MAGIC - Forecast data: Bronze → Silver (versioning, FX conversion)
-# MAGIC - Forecast FX rates: Bronze → Silver
-# MAGIC - Update Gold: close_status_gold for Phase 3 tasks
-# MAGIC 
-# MAGIC **Execution time:** ~3 minutes
+# MAGIC **Run this notebook** after Phase 1 & 2 processing is complete.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Setup
+# MAGIC ## Configuration
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
 from pyspark.sql.window import Window
-from datetime import datetime
-import random
+from datetime import datetime, timedelta
+import json
 
-spark.sql("USE CATALOG financial_close_lakehouse")
+# Catalog and schema configuration
+CATALOG = "financial_close_catalog"
+BRONZE_SCHEMA = "bronze_layer"
+SILVER_SCHEMA = "silver_layer"
+GOLD_SCHEMA = "gold_layer"
 
-# Configuration
-REPORTING_CURRENCY = "USD"
-CURRENT_PERIOD = "2025-12"
-FORECAST_VERSION = "Jan26_v1"
+# Period to process
+CURRENT_PERIOD = 202601  # January 2026
 
-print(f"✓ Processing Phase 3 for period: {CURRENT_PERIOD}")
-print(f"✓ Forecast version: {FORECAST_VERSION}")
+print(f"Processing Phase 3 data for period: {CURRENT_PERIOD}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Process Segmented Close Data (Bronze → Silver)
+# MAGIC ## 1. Standardize Segmented Close Data
 
 # COMMAND ----------
+
+print("Standardizing segmented close data...")
 
 # Read raw segmented data
-segmented_raw = spark.table("bronze.bu_segmented_raw")
+segmented_raw = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.bu_segmented_raw") \
+    .filter(col("period") == CURRENT_PERIOD)
 
-print(f"Raw segmented records: {segmented_raw.count()}")
-
-# COMMAND ----------
-
-# Get FX rates for the period
-fx_rates = (
-    spark.table("silver.fx_rates_std")
-    .filter(F.col("rate_date") == F.last_day(F.lit(f"{CURRENT_PERIOD}-01")))
-    .select(
-        F.col("quote_currency").alias("local_currency"),
-        F.col("rate").alias("fx_rate")
-    )
-)
-
-# COMMAND ----------
-
-# Standardize segmented close with FX conversion
-segmented_std = (
-    segmented_raw
-    .filter(F.col("period") == CURRENT_PERIOD)
-    
-    # Join with FX rates
-    .join(fx_rates, "local_currency", "left")
-    .withColumn("fx_rate", F.coalesce(F.col("fx_rate"), F.lit(1.0)))  # USD = 1.0
-    
-    # Convert to reporting currency
-    .withColumn("reporting_currency", F.lit(REPORTING_CURRENCY))
-    .withColumn("reporting_amount", F.col("local_amount") / F.col("fx_rate"))
-    
-    # Add audit columns
-    .withColumn("created_at", F.current_timestamp())
-    .withColumn("updated_at", F.current_timestamp())
-    
+# Calculate operating profit and FX impact
+segmented_std = segmented_raw \
+    .withColumn("operating_profit_local", 
+                col("revenue_local") - col("cogs_local") - col("opex_local")) \
+    .withColumn("operating_profit_reporting",
+                col("revenue_reporting") - col("cogs_reporting") - col("opex_reporting")) \
+    .withColumn("fx_impact_reporting", lit(0.0))  # Simplified - would calculate vs. budget/prior FX rates \
+    .withColumn("data_quality_flag",
+                when((col("revenue_local") < 0) | (col("operating_profit_reporting") / col("revenue_reporting") < -1), "WARN")
+                .when(col("revenue_local") == 0, "FAIL")
+                .otherwise("PASS")) \
     .select(
         "period",
-        "bu_code",
+        "bu",
         "segment",
         "product",
         "region",
-        "account_category",
         "local_currency",
-        "local_amount",
         "reporting_currency",
-        "reporting_amount",
-        "fx_rate",
-        "created_at",
-        "updated_at"
+        "revenue_local",
+        "cogs_local",
+        "opex_local",
+        "operating_profit_local",
+        "revenue_reporting",
+        "cogs_reporting",
+        "opex_reporting",
+        "operating_profit_reporting",
+        "fx_impact_reporting",
+        col("load_timestamp"),
+        "data_quality_flag",
+        "metadata"
     )
-)
 
 # Write to Silver
-segmented_std.write.mode("append").saveAsTable("silver.segmented_close_std")
+segmented_std.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{SILVER_SCHEMA}.segmented_close_std")
 
-seg_count = segmented_std.count()
-print(f"✓ Processed {seg_count} segmented close records")
+segmented_count = segmented_std.count()
+quality_issues = segmented_std.filter(col("data_quality_flag").isin(["WARN", "FAIL"])).count()
 
-# COMMAND ----------
-
-# Reconciliation: Check if segmented totals match trial balance
-print("\n🔍 Reconciliation Check: Segmented vs Trial Balance\n")
-
-# Segmented totals by BU and account category
-segmented_totals = (
-    segmented_std
-    .groupBy("bu_code", "account_category")
-    .agg(F.sum("reporting_amount").alias("segmented_total"))
-)
-
-# Trial balance totals (cut2) by BU and account category
-tb_totals = (
-    spark.table("silver.close_trial_balance_std")
-    .filter(F.col("period") == CURRENT_PERIOD)
-    .filter(F.col("cut_version") == "cut2")
-    .filter(F.col("account_category").isin(["Revenue", "COGS", "OpEx"]))
-    .groupBy("bu_code", "account_category")
-    .agg(F.sum("reporting_amount").alias("tb_total"))
-)
-
-# Compare
-reconciliation = (
-    segmented_totals
-    .join(tb_totals, ["bu_code", "account_category"], "full")
-    .withColumn("variance", F.col("segmented_total") - F.col("tb_total"))
-    .withColumn("variance_pct", 
-                F.round((F.col("variance") / F.abs(F.col("tb_total"))) * 100, 2))
-    .orderBy("bu_code", "account_category")
-)
-
-print("Reconciliation Results (Segmented vs Trial Balance):")
-display(reconciliation)
-
-# Flag significant variances (>1%)
-issues = reconciliation.filter(F.abs(F.col("variance_pct")) > 1.0).count()
-if issues > 0:
-    print(f"⚠️  Warning: {issues} variances exceed 1% threshold")
-else:
-    print("✓ All variances within acceptable tolerance (<1%)")
+print(f"✓ Standardized {segmented_count:,} segmented close records")
+print(f"  - Data quality issues: {quality_issues}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Process Forecast Data (Bronze → Silver)
+# MAGIC ## 2. Standardize Forecast Data
 
 # COMMAND ----------
+
+print("Standardizing forecast data...")
 
 # Read raw forecast data
-forecast_raw = spark.table("bronze.bu_forecast_raw")
+forecast_raw = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.bu_forecast_raw")
 
-print(f"Raw forecast records: {forecast_raw.count()}")
+# Get forecast FX rates
+fx_forecast = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.fx_forecast_raw")
 
-# COMMAND ----------
-
-# Get forecast FX rates (Base scenario, latest version)
-forecast_fx = (
-    spark.table("bronze.fx_forecast_raw")
-    .filter(F.col("scenario") == "Base")
+# Calculate operating profit
+forecast_std = forecast_raw \
+    .withColumn("operating_profit_local",
+                col("revenue_local") - col("cogs_local") - col("opex_local")) \
+    .withColumn("operating_profit_reporting",
+                col("revenue_reporting") - col("cogs_reporting") - col("opex_reporting")) \
+    .withColumn("fx_rate",
+                col("reporting_amount") / col("revenue_local")) \
+    .withColumn("data_quality_flag",
+                when((col("revenue_local") < 0), "WARN")
+                .when((col("scenario").isNull()), "FAIL")
+                .otherwise("PASS")) \
     .select(
-        F.col("forecast_date"),
-        F.col("quote_currency").alias("local_currency"),
-        F.col("forecasted_rate").alias("fx_rate")
-    )
-)
-
-# Create mapping of forecast period to forecast date (month-end)
-forecast_fx_monthly = (
-    forecast_fx
-    .withColumn("forecast_period", F.date_format(F.col("forecast_date"), "yyyy-MM"))
-    .groupBy("forecast_period", "local_currency")
-    .agg(F.avg("fx_rate").alias("fx_rate"))  # Average rate for the month
-)
-
-# COMMAND ----------
-
-# Standardize forecast data
-forecast_std = (
-    forecast_raw
-    .filter(F.col("forecast_version") == FORECAST_VERSION)
-    
-    # Join with forecast FX rates
-    .join(forecast_fx_monthly, ["forecast_period", "local_currency"], "left")
-    .withColumn("fx_rate", F.coalesce(F.col("fx_rate"), F.lit(1.0)))
-    
-    # Convert to reporting currency
-    .withColumn("reporting_currency", F.lit(REPORTING_CURRENCY))
-    .withColumn("reporting_amount", F.col("local_amount") / F.col("fx_rate"))
-    
-    # Add version metadata
-    .withColumn("forecast_created_at", F.lit(datetime(2025, 12, 8, 10, 0, 0)))
-    .withColumn("is_current_version", F.lit(True))
-    
-    # Add audit columns
-    .withColumn("created_at", F.current_timestamp())
-    .withColumn("updated_at", F.current_timestamp())
-    
-    .select(
-        F.col("forecast_version"),
-        "forecast_created_at",
-        "bu_code",
         "forecast_period",
-        "scenario",
-        "account_category",
+        "submission_date",
+        "bu",
         "segment",
+        "scenario",
         "local_currency",
-        "local_amount",
         "reporting_currency",
-        "reporting_amount",
-        "fx_rate",
-        "is_current_version",
-        "created_at",
-        "updated_at"
+        "revenue_local",
+        "cogs_local",
+        "opex_local",
+        "operating_profit_local",
+        "revenue_reporting",
+        "cogs_reporting",
+        "opex_reporting",
+        "operating_profit_reporting",
+        coalesce("fx_rate", lit(1.0)).alias("fx_rate"),
+        "assumptions",
+        col("load_timestamp"),
+        "data_quality_flag",
+        "metadata"
     )
-)
 
 # Write to Silver
-forecast_std.write.mode("append").saveAsTable("silver.forecast_std")
+forecast_std.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{SILVER_SCHEMA}.forecast_std")
 
 forecast_count = forecast_std.count()
-print(f"✓ Processed {forecast_count} forecast records")
-
-# COMMAND ----------
-
-# Show forecast summary by scenario
-forecast_summary = (
-    forecast_std
-    .filter(F.col("forecast_period") == CURRENT_PERIOD)
-    .filter(F.col("account_category") == "Operating Profit")
-    .groupBy("bu_code", "scenario")
-    .agg(F.sum("reporting_amount").alias("operating_profit"))
-    .orderBy("bu_code", "scenario")
-)
-
-print(f"\nForecast Operating Profit by BU and Scenario ({CURRENT_PERIOD}):")
-display(forecast_summary)
+print(f"✓ Standardized {forecast_count:,} forecast records")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Compare Actuals vs Forecast
+# MAGIC ## 3. Add Phase 3 Tasks
 
 # COMMAND ----------
 
-# Calculate actuals (from trial balance)
-actuals = (
-    spark.table("silver.close_trial_balance_std")
-    .filter(F.col("period") == CURRENT_PERIOD)
-    .filter(F.col("cut_version") == "cut2")
-    .groupBy("bu_code", "segment", "account_category")
-    .agg(F.sum("reporting_amount").alias("actual_amount"))
-)
+print("Adding Phase 3 tasks...")
 
-# Get Base scenario forecast
-forecast_base = (
-    forecast_std
-    .filter(F.col("forecast_period") == CURRENT_PERIOD)
-    .filter(F.col("scenario") == "Base")
-    .groupBy("bu_code", "segment", "account_category")
-    .agg(F.sum("reporting_amount").alias("forecast_amount"))
-)
+# Read existing tasks
+existing_tasks = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks") \
+    .filter(col("period") == CURRENT_PERIOD)
 
-# Calculate variances
-variance_analysis = (
-    actuals
-    .join(forecast_base, ["bu_code", "segment", "account_category"], "full")
-    .fillna(0, ["actual_amount", "forecast_amount"])
-    .withColumn("variance", F.col("actual_amount") - F.col("forecast_amount"))
-    .withColumn("variance_pct",
-                F.when(F.col("forecast_amount") != 0,
-                       F.round((F.col("variance") / F.abs(F.col("forecast_amount"))) * 100, 2))
-                .otherwise(None))
-    .orderBy(F.desc(F.abs(F.col("variance"))))
-)
+# Define Phase 3 tasks
+phase3_tasks = [
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T1-NA", "task_name": "Receive segmented files from business units",
+     "bu": "North America", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 6, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T1-EU", "task_name": "Receive segmented files from business units",
+     "bu": "Europe", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 6, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T1-AP", "task_name": "Receive segmented files from business units",
+     "bu": "Asia Pacific", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 6, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T1-LA", "task_name": "Receive segmented files from business units",
+     "bu": "Latin America", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 6, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T1-ME", "task_name": "Receive segmented files from business units",
+     "bu": "Middle East", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 6, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T2-NA", "task_name": "Receive forecast files from business units",
+     "bu": "North America", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 7, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T2-EU", "task_name": "Receive forecast files from business units",
+     "bu": "Europe", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 7, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T2-AP", "task_name": "Receive forecast files from business units",
+     "bu": "Asia Pacific", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 7, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T2-LA", "task_name": "Receive forecast files from business units",
+     "bu": "Latin America", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 7, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T2-ME", "task_name": "Receive forecast files from business units",
+     "bu": "Middle East", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 7, 17, 0),
+     "status": "completed", "priority": "high"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 3, "phase_name": "Data Gathering",
+     "task_id": "P3-T3", "task_name": "Receive forecast FX rates",
+     "bu": None, "owner_role": "Treasury", "planned_due_date": datetime(2026, 2, 7, 12, 0),
+     "status": "completed", "priority": "medium"},
+]
 
-print("\nTop 10 Variances (Actual vs Forecast):")
-display(variance_analysis.limit(10))
-
-# COMMAND ----------
-
-# Identify significant variances for agent to flag
-significant_variances = (
-    variance_analysis
-    .filter(F.abs(F.col("variance_pct")) > 10)  # >10% variance
-    .filter(F.abs(F.col("variance")) > 100000)  # >$100K absolute variance
-    .count()
-)
-
-print(f"\n📊 Variance Summary:")
-print(f"   Significant variances (>10% AND >$100K): {significant_variances}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4. Update Close Status for Phase 3 Tasks
-
-# COMMAND ----------
-
-# Get business units and phase 3 tasks
-bus = spark.table("config.business_units").select("bu_code").collect()
-bu_codes = [row.bu_code for row in bus]
-
-phase_tasks = spark.table("config.close_phase_definitions")
-phase3_tasks = [row for row in phase_tasks.filter(F.col("phase_id") == 3).collect()]
-
-# COMMAND ----------
-
-# Create status records for Phase 3
-status_records = []
-
+# Add common fields
 for task in phase3_tasks:
-    if task.is_bu_specific:
-        # Create one task per BU
-        for bu_code in bu_codes:
-            if task.task_id == 301:  # Receive segmented files
-                completion = datetime(2025, 12, 8, 16, 0, 0)
-                task_status = "completed"
-                comments = f"Segmented file received and validated. {seg_count // len(bu_codes)} records."
-            elif task.task_id == 302:  # Receive forecast files
-                completion = datetime(2025, 12, 9, 10, 0, 0)
-                task_status = "completed"
-                comments = f"Forecast v{FORECAST_VERSION} received with 3 scenarios."
-            else:
-                completion = None
-                task_status = "pending"
-                comments = None
-            
-            status_records.append({
-                "period": CURRENT_PERIOD,
-                "phase_id": task.phase_id,
-                "phase_name": task.phase_name,
-                "task_id": task.task_id,
-                "task_name": task.task_name,
-                "bu_code": bu_code,
-                "planned_due_date": "2025-12-08" if task.task_id == 301 else "2025-12-09",
-                "actual_completion_timestamp": completion,
-                "status": task_status,
-                "owner_role": task.owner_role,
-                "comments": comments,
-                "last_updated_by": "segmented_forecast_agent" if task_status == "completed" else None,
-                "created_at": datetime.now(),
-                "updated_at": datetime.now()
-            })
-    else:
-        # Group-level task (Forecast FX)
-        if task.task_id == 303:
-            completion = datetime(2025, 12, 9, 14, 0, 0)
-            task_status = "completed"
-            comments = "Forecast FX curves received for all currencies. Base, Upside, Downside scenarios."
-        else:
-            completion = None
-            task_status = "pending"
-            comments = None
-        
-        status_records.append({
-            "period": CURRENT_PERIOD,
-            "phase_id": task.phase_id,
-            "phase_name": task.phase_name,
-            "task_id": task.task_id,
-            "task_name": task.task_name,
-            "bu_code": None,
-            "planned_due_date": "2025-12-09",
-            "actual_completion_timestamp": completion,
-            "status": task_status,
-            "owner_role": task.owner_role,
-            "comments": comments,
-            "last_updated_by": "fx_agent" if task_status == "completed" else None,
-            "created_at": datetime.now(),
-            "updated_at": datetime.now()
-        })
+    task["actual_start_timestamp"] = datetime.now() if task["status"] in ["completed", "in_progress"] else None
+    task["actual_completion_timestamp"] = datetime.now() if task["status"] == "completed" else None
+    task["blocking_reason"] = None
+    task["comments"] = None
+    task["agent_assigned"] = "Segmented & Forecast Agent" if "segmented" in task["task_name"].lower() or "forecast" in task["task_name"].lower() else None
+    task["dependencies"] = None
+    task["last_updated_timestamp"] = datetime.now()
+    task["metadata"] = json.dumps({"created_by": "phase3_processing", "auto_generated": True})
+
+# Create DataFrame for new tasks
+new_tasks_df = spark.createDataFrame(phase3_tasks)
+
+# Union with existing tasks and write
+all_tasks = existing_tasks.union(new_tasks_df)
+all_tasks.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks")
+
+print(f"✓ Added {len(phase3_tasks)} Phase 3 tasks")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Update Close Status
+
+# COMMAND ----------
+
+print("Updating close status...")
+
+# Recalculate status with Phase 3 tasks included
+tasks_df = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks") \
+    .filter(col("period") == CURRENT_PERIOD)
+
+# Calculate status by BU
+bu_status = tasks_df \
+    .filter(col("bu").isNotNull()) \
+    .groupBy("period", "bu") \
+    .agg(
+        max("phase_id").alias("phase_id"),
+        max("phase_name").alias("phase_name"),
+        count("*").alias("total_tasks"),
+        sum(when(col("status") == "completed", 1).otherwise(0)).alias("completed_tasks"),
+        sum(when(col("status") == "blocked", 1).otherwise(0)).alias("blocked_tasks")
+    ) \
+    .withColumn("pct_tasks_completed", 
+                round(col("completed_tasks") / col("total_tasks") * 100, 2)) \
+    .withColumn("overall_status",
+                when(col("pct_tasks_completed") == 100, "completed")
+                .when(col("blocked_tasks") > 0, "issues")
+                .when(col("completed_tasks") > 0, "in_progress")
+                .otherwise("not_started")) \
+    .withColumn("days_since_period_end", lit(7))  # Day 7 \
+    .withColumn("days_to_sla", lit(3))  # 3 days to SLA \
+    .withColumn("sla_status", lit("on_track")) \
+    .withColumn("key_issues", lit(None).cast("string")) \
+    .withColumn("last_milestone", lit("Segmented and forecast data received")) \
+    .withColumn("next_milestone", lit("Segmented close review meeting")) \
+    .withColumn("agent_summary",
+                concat(
+                    lit("BU "), col("bu"),
+                    lit(" has completed "), col("pct_tasks_completed"),
+                    lit("% of tasks. Ready for Phase 4 review.")
+                )) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"source": "phase3_processing"}'))
+
+# Add consolidated status
+consolidated_status = tasks_df \
+    .groupBy("period") \
+    .agg(
+        max("phase_id").alias("phase_id"),
+        lit("Review").alias("phase_name"),
+        count("*").alias("total_tasks"),
+        sum(when(col("status") == "completed", 1).otherwise(0)).alias("completed_tasks"),
+        sum(when(col("status") == "blocked", 1).otherwise(0)).alias("blocked_tasks")
+    ) \
+    .withColumn("bu", lit("CONSOLIDATED")) \
+    .withColumn("pct_tasks_completed",
+                round(col("completed_tasks") / col("total_tasks") * 100, 2)) \
+    .withColumn("overall_status", lit("in_progress")) \
+    .withColumn("days_since_period_end", lit(7)) \
+    .withColumn("days_to_sla", lit(3)) \
+    .withColumn("sla_status", lit("on_track")) \
+    .withColumn("key_issues", lit(None).cast("string")) \
+    .withColumn("last_milestone", lit("Phase 3 data gathering completed")) \
+    .withColumn("next_milestone", lit("Phase 4 review meetings")) \
+    .withColumn("agent_summary",
+                concat(
+                    lit("Close progress: "),
+                    col("pct_tasks_completed"),
+                    lit("% complete. Entering Phase 4 - Review.")
+                )) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"source": "phase3_processing"}'))
+
+# Union and write
+all_status = bu_status.union(consolidated_status)
+all_status.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_status_gold")
+
+print(f"✓ Updated close status")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Populate Close Results (Preliminary)
+
+# COMMAND ----------
+
+print("Populating preliminary close results...")
+
+# Aggregate segmented close to various levels
+segmented_std = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.segmented_close_std") \
+    .filter(col("period") == CURRENT_PERIOD)
+
+# Calculate gross profit
+results = segmented_std \
+    .withColumn("gross_profit_local", col("revenue_local") - col("cogs_local")) \
+    .withColumn("gross_profit_reporting", col("revenue_reporting") - col("cogs_reporting"))
+
+# Full granularity (BU + Segment + Product + Region)
+detailed_results = results \
+    .withColumn("variance_vs_prior_period", lit(0.0)) \
+    .withColumn("variance_vs_prior_pct", lit(0.0)) \
+    .withColumn("variance_vs_forecast", lit(0.0)) \
+    .withColumn("variance_vs_forecast_pct", lit(0.0)) \
+    .withColumn("gross_margin_pct", 
+                round(col("gross_profit_reporting") / col("revenue_reporting") * 100, 2)) \
+    .withColumn("operating_margin_pct",
+                round(col("operating_profit_reporting") / col("revenue_reporting") * 100, 2)) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"preliminary": true}')) \
+    .select(
+        "period", "bu", "segment", "product", "region",
+        "local_currency", "reporting_currency",
+        "revenue_local", "cogs_local", "gross_profit_local", "opex_local", "operating_profit_local",
+        "revenue_reporting", "cogs_reporting", "gross_profit_reporting", "opex_reporting", "operating_profit_reporting",
+        "fx_impact_reporting", "variance_vs_prior_period", "variance_vs_prior_pct",
+        "variance_vs_forecast", "variance_vs_forecast_pct",
+        "gross_margin_pct", "operating_margin_pct",
+        "load_timestamp", "metadata"
+    )
+
+# BU + Segment level (aggregate products and regions)
+bu_segment_results = results \
+    .groupBy("period", "bu", "segment", "local_currency", "reporting_currency") \
+    .agg(
+        sum("revenue_local").alias("revenue_local"),
+        sum("cogs_local").alias("cogs_local"),
+        sum("opex_local").alias("opex_local"),
+        sum("operating_profit_local").alias("operating_profit_local"),
+        sum("revenue_reporting").alias("revenue_reporting"),
+        sum("cogs_reporting").alias("cogs_reporting"),
+        sum("opex_reporting").alias("opex_reporting"),
+        sum("operating_profit_reporting").alias("operating_profit_reporting"),
+        sum("fx_impact_reporting").alias("fx_impact_reporting")
+    ) \
+    .withColumn("product", lit("ALL")) \
+    .withColumn("region", lit("ALL")) \
+    .withColumn("gross_profit_local", col("revenue_local") - col("cogs_local")) \
+    .withColumn("gross_profit_reporting", col("revenue_reporting") - col("cogs_reporting")) \
+    .withColumn("variance_vs_prior_period", lit(0.0)) \
+    .withColumn("variance_vs_prior_pct", lit(0.0)) \
+    .withColumn("variance_vs_forecast", lit(0.0)) \
+    .withColumn("variance_vs_forecast_pct", lit(0.0)) \
+    .withColumn("gross_margin_pct",
+                round(col("gross_profit_reporting") / col("revenue_reporting") * 100, 2)) \
+    .withColumn("operating_margin_pct",
+                round(col("operating_profit_reporting") / col("revenue_reporting") * 100, 2)) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"aggregation": "bu_segment"}'))
+
+# BU level (all segments)
+bu_results = results \
+    .groupBy("period", "bu", "local_currency", "reporting_currency") \
+    .agg(
+        sum("revenue_local").alias("revenue_local"),
+        sum("cogs_local").alias("cogs_local"),
+        sum("opex_local").alias("opex_local"),
+        sum("operating_profit_local").alias("operating_profit_local"),
+        sum("revenue_reporting").alias("revenue_reporting"),
+        sum("cogs_reporting").alias("cogs_reporting"),
+        sum("opex_reporting").alias("opex_reporting"),
+        sum("operating_profit_reporting").alias("operating_profit_reporting"),
+        sum("fx_impact_reporting").alias("fx_impact_reporting")
+    ) \
+    .withColumn("segment", lit("ALL")) \
+    .withColumn("product", lit("ALL")) \
+    .withColumn("region", lit("ALL")) \
+    .withColumn("gross_profit_local", col("revenue_local") - col("cogs_local")) \
+    .withColumn("gross_profit_reporting", col("revenue_reporting") - col("cogs_reporting")) \
+    .withColumn("variance_vs_prior_period", lit(0.0)) \
+    .withColumn("variance_vs_prior_pct", lit(0.0)) \
+    .withColumn("variance_vs_forecast", lit(0.0)) \
+    .withColumn("variance_vs_forecast_pct", lit(0.0)) \
+    .withColumn("gross_margin_pct",
+                round(col("gross_profit_reporting") / col("revenue_reporting") * 100, 2)) \
+    .withColumn("operating_margin_pct",
+                round(col("operating_profit_reporting") / col("revenue_reporting") * 100, 2)) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"aggregation": "bu_total"}'))
+
+# Consolidated (all BUs)
+consolidated_results = results \
+    .groupBy("period") \
+    .agg(
+        sum("revenue_reporting").alias("revenue_reporting"),
+        sum("cogs_reporting").alias("cogs_reporting"),
+        sum("opex_reporting").alias("opex_reporting"),
+        sum("operating_profit_reporting").alias("operating_profit_reporting"),
+        sum("fx_impact_reporting").alias("fx_impact_reporting")
+    ) \
+    .withColumn("bu", lit("CONSOLIDATED")) \
+    .withColumn("segment", lit("ALL")) \
+    .withColumn("product", lit("ALL")) \
+    .withColumn("region", lit("ALL")) \
+    .withColumn("local_currency", lit("USD")) \
+    .withColumn("reporting_currency", lit("USD")) \
+    .withColumn("revenue_local", col("revenue_reporting")) \
+    .withColumn("cogs_local", col("cogs_reporting")) \
+    .withColumn("opex_local", col("opex_reporting")) \
+    .withColumn("operating_profit_local", col("operating_profit_reporting")) \
+    .withColumn("gross_profit_local", col("revenue_local") - col("cogs_local")) \
+    .withColumn("gross_profit_reporting", col("revenue_reporting") - col("cogs_reporting")) \
+    .withColumn("variance_vs_prior_period", lit(0.0)) \
+    .withColumn("variance_vs_prior_pct", lit(0.0)) \
+    .withColumn("variance_vs_forecast", lit(0.0)) \
+    .withColumn("variance_vs_forecast_pct", lit(0.0)) \
+    .withColumn("gross_margin_pct",
+                round(col("gross_profit_reporting") / col("revenue_reporting") * 100, 2)) \
+    .withColumn("operating_margin_pct",
+                round(col("operating_profit_reporting") / col("revenue_reporting") * 100, 2)) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"aggregation": "consolidated"}'))
+
+# Union all levels
+all_results = detailed_results \
+    .union(bu_segment_results.select(detailed_results.columns)) \
+    .union(bu_results.select(detailed_results.columns)) \
+    .union(consolidated_results.select(detailed_results.columns))
 
 # Write to Gold
-status_df = spark.createDataFrame(status_records)
-status_df.write.mode("append").saveAsTable("gold.close_status_gold")
+all_results.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_results_gold")
 
-print(f"✓ Created {len(status_records)} close status records for Phase 3")
-
-# COMMAND ----------
-
-# Show overall close status
-overall_status = (
-    spark.table("gold.close_status_gold")
-    .filter(F.col("period") == CURRENT_PERIOD)
-    .groupBy("phase_name", "status")
-    .count()
-    .orderBy("phase_name", "status")
-)
-
-print("\nOverall Close Status (All Phases):")
-display(overall_status)
+results_count = all_results.count()
+print(f"✓ Populated {results_count:,} close result records (all aggregation levels)")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Prepare Data for Phase 4 Review
+# MAGIC ## 6. Populate Forecast Results
 
 # COMMAND ----------
 
-# Create summary for segmented close review meeting
-segmented_summary = (
-    segmented_std
-    .groupBy("bu_code", "segment", "account_category")
-    .agg(F.sum("reporting_amount").alias("total_amount"))
-    .groupBy("bu_code", "segment")
-    .pivot("account_category", ["Revenue", "COGS", "OpEx"])
-    .sum("total_amount")
-    .fillna(0)
-    .withColumn("Operating_Profit", F.col("Revenue") + F.col("COGS") + F.col("OpEx"))
-    .withColumn("Operating_Margin_Pct",
-                F.round((F.col("Operating_Profit") / F.col("Revenue")) * 100, 2))
-    .orderBy("bu_code", F.desc("Operating_Profit"))
-)
+print("Populating forecast results...")
 
-print("\nSegmented Close Summary (for review meeting):")
-display(segmented_summary)
+# Get forecast data
+forecast_std = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.forecast_std")
 
-# COMMAND ----------
-
-# Create summary for forecast review meeting
-forecast_review = (
-    variance_analysis
-    .filter(F.col("account_category").isin(["Revenue", "COGS", "OpEx"]))
-    .groupBy("bu_code")
+# Aggregate by BU + Segment + Scenario
+forecast_results = forecast_std \
+    .groupBy("forecast_period", "submission_date", "bu", "segment", "scenario", "local_currency", "reporting_currency") \
     .agg(
-        F.sum(F.when(F.col("account_category") == "Revenue", F.col("actual_amount")).otherwise(0)).alias("actual_revenue"),
-        F.sum(F.when(F.col("account_category") == "Revenue", F.col("forecast_amount")).otherwise(0)).alias("forecast_revenue"),
-        F.sum(F.when(F.col("account_category") == "Revenue", F.col("variance")).otherwise(0)).alias("revenue_variance"),
-        F.sum(F.col("actual_amount") + F.col("COGS") + F.col("OpEx")).alias("actual_op"),
-        F.sum(F.col("forecast_amount") + F.col("COGS") + F.col("OpEx")).alias("forecast_op")
-    )
-)
+        sum("revenue_local").alias("revenue_forecast_local"),
+        sum("cogs_local").alias("cogs_forecast_local"),
+        sum("opex_local").alias("opex_forecast_local"),
+        sum("operating_profit_local").alias("operating_profit_forecast_local"),
+        sum("revenue_reporting").alias("revenue_forecast_reporting"),
+        sum("cogs_reporting").alias("cogs_forecast_reporting"),
+        sum("opex_reporting").alias("opex_forecast_reporting"),
+        sum("operating_profit_reporting").alias("operating_profit_forecast_reporting"),
+        max("assumptions").alias("assumptions")
+    ) \
+    .withColumn("revenue_actual_reporting", lit(None).cast("decimal(18,2)")) \
+    .withColumn("operating_profit_actual_reporting", lit(None).cast("decimal(18,2)")) \
+    .withColumn("variance_revenue", lit(None).cast("decimal(18,2)")) \
+    .withColumn("variance_operating_profit", lit(None).cast("decimal(18,2)")) \
+    .withColumn("variance_revenue_pct", lit(None).cast("decimal(10,2)")) \
+    .withColumn("variance_operating_profit_pct", lit(None).cast("decimal(10,2)")) \
+    .withColumn("forecast_accuracy_score", lit(None).cast("decimal(5,2)")) \
+    .withColumn("variance_drivers", lit(None).cast("string")) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"actuals_available": false}'))
 
-# Note: The above aggregation is simplified - in practice would need more careful calculation
-# For demo purposes, let's create a cleaner version
-
-forecast_review_clean = (
-    variance_analysis
-    .filter(F.col("account_category") == "Operating Profit")
-    .groupBy("bu_code")
+# Consolidated forecast
+consolidated_forecast = forecast_std \
+    .groupBy("forecast_period", "submission_date", "scenario") \
     .agg(
-        F.sum("actual_amount").alias("actual_operating_profit"),
-        F.sum("forecast_amount").alias("forecast_operating_profit"),
-        F.sum("variance").alias("variance"),
-        F.round(F.avg("variance_pct"), 2).alias("avg_variance_pct")
-    )
-    .orderBy(F.desc(F.abs(F.col("variance"))))
-)
+        sum("revenue_reporting").alias("revenue_forecast_reporting"),
+        sum("cogs_reporting").alias("cogs_forecast_reporting"),
+        sum("opex_reporting").alias("opex_forecast_reporting"),
+        sum("operating_profit_reporting").alias("operating_profit_forecast_reporting")
+    ) \
+    .withColumn("bu", lit("CONSOLIDATED")) \
+    .withColumn("segment", lit("ALL")) \
+    .withColumn("local_currency", lit("USD")) \
+    .withColumn("reporting_currency", lit("USD")) \
+    .withColumn("revenue_forecast_local", col("revenue_forecast_reporting")) \
+    .withColumn("cogs_forecast_local", col("cogs_forecast_reporting")) \
+    .withColumn("opex_forecast_local", col("opex_forecast_reporting")) \
+    .withColumn("operating_profit_forecast_local", col("operating_profit_forecast_reporting")) \
+    .withColumn("assumptions", lit("Consolidated forecast across all BUs")) \
+    .withColumn("revenue_actual_reporting", lit(None).cast("decimal(18,2)")) \
+    .withColumn("operating_profit_actual_reporting", lit(None).cast("decimal(18,2)")) \
+    .withColumn("variance_revenue", lit(None).cast("decimal(18,2)")) \
+    .withColumn("variance_operating_profit", lit(None).cast("decimal(18,2)")) \
+    .withColumn("variance_revenue_pct", lit(None).cast("decimal(10,2)")) \
+    .withColumn("variance_operating_profit_pct", lit(None).cast("decimal(10,2)")) \
+    .withColumn("forecast_accuracy_score", lit(None).cast("decimal(5,2)")) \
+    .withColumn("variance_drivers", lit(None).cast("string")) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"aggregation": "consolidated"}'))
 
-# Since we don't have Operating Profit in actuals, let's calculate it differently
-forecast_review_by_bu = (
-    actuals
-    .join(forecast_base, ["bu_code", "account_category"], "full")
-    .fillna(0)
-    .groupBy("bu_code", "account_category")
-    .agg(
-        F.sum("actual_amount").alias("actual_total"),
-        F.sum("forecast_amount").alias("forecast_total")
-    )
-    .groupBy("bu_code")
-    .pivot("account_category", ["Revenue", "COGS", "OpEx"])
-    .agg(
-        F.first("actual_total").alias("actual"),
-        F.first("forecast_total").alias("forecast")
-    )
-)
+# Union all
+all_forecast_results = forecast_results.union(consolidated_forecast)
 
-# Simplified version for display
-forecast_comparison = (
-    actuals
-    .groupBy("bu_code", "account_category")
-    .agg(F.sum("actual_amount").alias("actual_amount"))
-    .join(
-        forecast_base.groupBy("bu_code", "account_category").agg(F.sum("forecast_amount").alias("forecast_amount")),
-        ["bu_code", "account_category"]
-    )
-    .withColumn("variance", F.col("actual_amount") - F.col("forecast_amount"))
-    .withColumn("variance_pct", 
-                F.when(F.col("forecast_amount") != 0,
-                       F.round((F.col("variance") / F.abs(F.col("forecast_amount"))) * 100, 1))
-                .otherwise(None))
-    .filter(F.col("account_category").isin(["Revenue", "COGS", "OpEx"]))
-    .orderBy("bu_code", "account_category")
-)
+# Write to Gold
+all_forecast_results.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.forecast_results_gold")
 
-print("\nForecast vs Actuals Comparison (for review meeting):")
-display(forecast_comparison)
+forecast_results_count = all_forecast_results.count()
+print(f"✓ Populated {forecast_results_count:,} forecast result records")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Processing Summary
+# MAGIC ## 7. Verify Processing
 
 # COMMAND ----------
 
-print("\n" + "="*80)
-print("PHASE 3 PROCESSING COMPLETE")
-print("="*80)
+print("\n=== Phase 3 Processing Summary ===\n")
 
-print(f"\n✓ Segmented Close Records: {seg_count}")
-print(f"✓ Forecast Records: {forecast_count}")
-print(f"✓ Close Status Tasks: {len(status_records)}")
+# Silver tables
+print("Silver Layer:")
+print(f"  segmented_close_std: {spark.table(f'{CATALOG}.{SILVER_SCHEMA}.segmented_close_std').count():,} records")
+print(f"  forecast_std: {spark.table(f'{CATALOG}.{SILVER_SCHEMA}.forecast_std').count():,} records")
 
-print(f"\nPeriod: {CURRENT_PERIOD}")
-print(f"Phase 3 Status: All tasks completed")
+# Gold tables
+print("\nGold Layer:")
+print(f"  close_phase_tasks: {spark.table(f'{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks').count():,} tasks")
+print(f"  close_status_gold: {spark.table(f'{CATALOG}.{GOLD_SCHEMA}.close_status_gold').count():,} status records")
+print(f"  close_results_gold: {spark.table(f'{CATALOG}.{GOLD_SCHEMA}.close_results_gold').count():,} result records")
+print(f"  forecast_results_gold: {spark.table(f'{CATALOG}.{GOLD_SCHEMA}.forecast_results_gold').count():,} forecast records")
 
-if issues > 0:
-    print(f"\n⚠️  Reconciliation Issues: {issues} variances >1%")
-else:
-    print(f"\n✓ Reconciliation: All variances within tolerance")
+# COMMAND ----------
 
-print(f"\nSignificant Variances: {significant_variances} (>10% and >$100K)")
+# Display samples
+print("\n=== Close Results (Consolidated) ===")
+display(
+    spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_results_gold")
+    .filter(col("bu") == "CONSOLIDATED")
+    .select("period", "revenue_reporting", "operating_profit_reporting", "operating_margin_pct")
+)
 
-print("\n📊 Next Steps:")
-print("1. Run notebook 05 to activate Close Supervisor Agent")
-print("2. Review variance analysis for Phase 4 meetings")
-print("3. Run notebooks 06-07 for agent automation")
+print("\n=== Forecast Results (Base Scenario) ===")
+display(
+    spark.table(f"{CATALOG}.{GOLD_SCHEMA}.forecast_results_gold")
+    .filter((col("scenario") == "Base") & (col("bu") == "CONSOLIDATED"))
+    .select("forecast_period", "revenue_forecast_reporting", "operating_profit_forecast_reporting")
+)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## ✅ Phase 3 Processing Complete
-# MAGIC 
-# MAGIC **Processed:**
-# MAGIC - ✓ Segmented close data standardized and validated
-# MAGIC - ✓ Forecast data with multiple scenarios converted
-# MAGIC - ✓ Forecast FX rates integrated
-# MAGIC - ✓ Variance analysis (actual vs forecast) computed
-# MAGIC - ✓ Close status updated for Phase 3
-# MAGIC 
-# MAGIC **Ready for:**
-# MAGIC - Phase 4 review meetings
-# MAGIC - Agent-driven analysis and reporting
-# MAGIC - Final close publication (Phase 5)
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print(f"""
+✓ Phase 3 Processing Complete!
+
+Processed for period: {CURRENT_PERIOD}
+
+Silver Tables Updated:
+- segmented_close_std: Segmented P&L with operating profit and FX impact
+- forecast_std: Multi-scenario forecasts with assumptions
+
+Gold Tables Updated:
+- close_phase_tasks: Phase 3 tasks added and tracked
+- close_status_gold: Status updated for Phase 3 completion
+- close_results_gold: Preliminary close results at all aggregation levels
+- forecast_results_gold: Forecast results ready for variance analysis
+
+Next Steps:
+1. Run agent notebooks (05-07) for automated analysis and reporting
+2. Schedule Phase 4 review meetings
+3. Use Genie to analyze variances and investigate anomalies
+
+Current Phase: Phase 4 - Review (ready to start)
+Next Milestone: Segmented close review meeting
+""")

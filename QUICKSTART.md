@@ -1,407 +1,361 @@
-# Quick Start Guide
+# Quick Start Guide - Financial Close Agentic Solution
 
-## Get Started in 30 Minutes
-
-Follow this guide to deploy the financial close solution to your Azure Databricks workspace.
-
----
+This guide will help you get the financial close solution up and running in your Azure Databricks environment in under 1 hour.
 
 ## Prerequisites
 
 Before you begin, ensure you have:
 
-- ✅ Azure Databricks workspace (Premium tier)
-- ✅ Unity Catalog enabled with metastore configured
-- ✅ Permissions to:
-  - Create catalogs, schemas, and tables
-  - Create and run notebooks
-  - Create Databricks workflows
-  - Create Genie spaces (optional)
-  - Create SQL dashboards (optional)
+- [ ] Azure Databricks workspace (Premium or Enterprise tier)
+- [ ] Unity Catalog enabled on your workspace
+- [ ] Genie feature enabled (check with Databricks support if needed)
+- [ ] Permissions to create catalogs, schemas, and tables
+- [ ] Access to create notebooks and workflows
+- [ ] Basic familiarity with Databricks and SQL
 
----
+## 30-Minute Quick Start
 
-## Step 1: Upload Notebooks (5 minutes)
+### Step 1: Clone Repository (2 minutes)
 
-### Option A: Via Databricks UI
-1. Open your Databricks workspace
-2. Navigate to **Workspace** → **Users** → your username
-3. Create folder: `financial_close_solution`
-4. Click **Import** → **Import from files**
-5. Upload all notebooks from the `notebooks/` folder
+1. Navigate to your Databricks workspace
+2. In the Workspace panel, create a new folder: `/Financial_Close`
+3. Import all notebooks from the `notebooks/` directory
 
-### Option B: Via Databricks CLI
-```bash
-# Install Databricks CLI if not already installed
-pip install databricks-cli
+### Step 2: Configure Environment (3 minutes)
 
-# Configure authentication
-databricks configure --token
+1. Open notebook `01_setup_schema_and_tables.py`
+2. Update the configuration section:
+   ```python
+   CATALOG = "financial_close_catalog"  # Change if needed
+   CATALOG_LOCATION = "abfss://your-container@your-storage.dfs.core.windows.net/financial_close"
+   ```
+3. If you don't have ADLS Gen2, Databricks managed storage will work fine for testing
 
-# Upload notebooks
-databricks workspace import_dir ./notebooks /Users/your.email@company.com/financial_close_solution
-```
+### Step 3: Create Lakehouse Structure (5 minutes)
 
----
+1. Attach notebook `01_setup_schema_and_tables.py` to a cluster (any size will work)
+2. Run the entire notebook (⌘/Ctrl + Shift + Enter)
+3. Verify completion: You should see "✓ Setup Complete!" at the end
 
-## Step 2: Run Setup Notebooks (15 minutes)
+Expected output:
+- 1 catalog created
+- 3 schemas created
+- 15 tables created
 
-Execute notebooks **in order**:
+### Step 4: Generate Test Data (3 minutes)
 
-### 2.1 Create Schema and Tables
-```python
-# Run: notebooks/01_setup_schema_and_tables.py
-```
-**What it does:**
-- Creates `financial_close_lakehouse` catalog
-- Creates Bronze/Silver/Gold schemas
-- Defines all Delta tables with column comments
-- Inserts configuration data (BUs, phases, agents)
+1. Open notebook `02_synthetic_data_generation.py`
+2. Verify the period configuration:
+   ```python
+   CURRENT_PERIOD = 202601  # January 2026
+   ```
+3. Run the entire notebook
+4. Verify: Bronze tables should now contain synthetic data
 
-**Execution time:** ~2 minutes  
-**Expected output:** "✅ LAKEHOUSE SETUP COMPLETE"
+Expected output:
+- 2,000+ FX rate records
+- 2,000+ trial balance records
+- 500+ segmented close records
+- 1,000+ forecast records
 
----
+### Step 5: Process Financial Close Data (7 minutes)
 
-### 2.2 Generate Synthetic Data
-```python
-# Run: notebooks/02_synthetic_data_generation.py
-```
-**What it does:**
-- Generates 2 years of FX rates
-- Creates trial balance for 6 BUs × 12 months
-- Generates segmented and forecast data
+1. Run notebook `03_ingest_and_standardize_phase1_2.py` (Phase 1 & 2)
+   - Wait for completion (~3 minutes)
+   - Verify Silver and Gold tables are populated
 
-**Execution time:** ~5 minutes  
-**Expected output:** "✅ SYNTHETIC DATA GENERATION COMPLETE" (~78K rows)
+2. Run notebook `04_ingest_and_standardize_phase3.py` (Phase 3)
+   - Wait for completion (~2 minutes)
+   - Verify close results and forecast results are available
 
----
+### Step 6: Run Agents (5 minutes)
 
-### 2.3 Process Phase 1 & 2 Data
-```python
-# Run: notebooks/03_ingest_and_standardize_phase1_2.py
-```
-**What it does:**
-- Validates and standardizes FX rates
-- Converts trial balance to reporting currency
-- Populates close status for Phase 1 & 2
+Run the agent notebooks in sequence:
 
-**Execution time:** ~3 minutes  
-**Expected output:** "✅ PHASE 1 & 2 PROCESSING COMPLETE"
+1. `05_agent_logic_close_supervisor.py` - Orchestrator agent
+2. `06_agent_logic_fx_and_pre_close.py` - FX and PreClose agents
+3. `07_agent_logic_segmented_and_forecast.py` - Segmented, Forecast, and Reporting agents
 
----
+Each should complete in 1-2 minutes and log actions to `close_agent_logs`.
 
-### 2.4 Process Phase 3 Data
-```python
-# Run: notebooks/04_ingest_and_standardize_phase3.py
-```
-**What it does:**
-- Processes segmented close data
-- Integrates forecast data
-- Calculates variances
+### Step 7: Create Dashboard Views (2 minutes)
 
-**Execution time:** ~3 minutes  
-**Expected output:** "✅ PHASE 3 PROCESSING COMPLETE"
+1. Open notebook `08_dashboards_and_genie_instructions.sql`
+2. Run all cells in the "Helper Views for Dashboards" section
+3. Verify: 6 views should be created in the Gold schema
 
----
+### Step 8: Set Up Genie Space (3 minutes)
 
-### 2.5 Run Agent Notebooks
-```python
-# Run in sequence:
-# - notebooks/05_agent_logic_close_supervisor.py
-# - notebooks/06_agent_logic_fx_and_pre_close.py
-# - notebooks/07_agent_logic_segmented_and_forecast.py
-```
-**What it does:**
-- Orchestrates close workflow
-- Validates FX and trial balance
-- Calculates final KPIs
+1. In Databricks workspace, navigate to **Genie** in the left sidebar
+2. Click **Create Space** → Name it "Financial Close Assistant"
+3. Add tables:
+   - Navigate to "Add Data"
+   - Select `financial_close_catalog.gold_layer.*`
+   - Add all Gold tables and the views you created
+4. Add instructions:
+   - Click "Space Settings" → "Instructions"
+   - Copy/paste the Genie instructions from notebook 08
+5. Save the space
 
-**Execution time:** ~5 minutes total  
-**Expected output:** "✅ FINANCIAL CLOSE FOR 2025-12 IS COMPLETE"
+### Step 9: Test Genie (2 minutes)
 
----
+In your Genie space, try these queries:
 
-### 2.6 Set Up Dashboards and Genie
+1. "Show me the current close status by BU"
+2. "What is the consolidated revenue for period 202601?"
+3. "Which tasks are overdue?"
+
+Verify that Genie returns accurate results with natural language.
+
+### Step 10: Verify Everything Works (3 minutes)
+
+Run these verification queries in a SQL notebook:
+
 ```sql
-# Run: notebooks/08_dashboards_and_genie_instructions.sql
-```
-**What it does:**
-- Creates 10 SQL views for dashboards
-- Provides Genie configuration instructions
-
-**Execution time:** ~1 minute  
-**Expected output:** List of views created
-
----
-
-## Step 3: Verify Installation (5 minutes)
-
-### Check Data in Gold Layer
-```sql
--- In Databricks SQL editor, run:
-
-USE CATALOG financial_close_lakehouse;
+USE CATALOG financial_close_catalog;
+USE SCHEMA gold_layer;
 
 -- Check close status
-SELECT * FROM gold.close_status_gold 
-WHERE period = '2025-12' 
-LIMIT 10;
+SELECT * FROM close_status_gold WHERE period = 202601;
 
 -- Check close results
-SELECT * FROM gold.close_results_gold 
-WHERE period = '2025-12' 
-  AND bu_code = 'CONSOLIDATED' 
-LIMIT 10;
+SELECT bu, revenue_reporting, operating_profit_reporting, operating_margin_pct
+FROM close_results_gold 
+WHERE period = 202601 AND segment = 'ALL' AND product = 'ALL';
+
+-- Check agent logs
+SELECT agent_name, action, status, COUNT(*) as actions
+FROM close_agent_logs
+WHERE period = 202601
+GROUP BY agent_name, action, status
+ORDER BY agent_name, action;
 
 -- Check KPIs
-SELECT * FROM gold.close_kpi_gold 
-WHERE period = '2025-12';
+SELECT kpi_name, kpi_value, kpi_unit, status
+FROM close_kpi_gold
+WHERE period = 202601 AND bu = 'CONSOLIDATED';
 ```
 
-**Expected results:**
-- ✅ `close_status_gold`: ~84 rows (all phases complete)
-- ✅ `close_results_gold`: ~300+ rows (segmented + consolidated)
-- ✅ `close_kpi_gold`: ~12 rows (6 BUs + group-level KPIs)
+All queries should return data without errors.
 
----
+## What You've Built
 
-## Step 4: Optional - Set Up Genie Space (5 minutes)
+Congratulations! In 30 minutes, you've created:
 
-1. Navigate to **Genie** in Databricks UI
-2. Click **Create Space**
-3. Name: "Financial Close Assistant"
-4. Add tables:
-   - `gold.close_status_gold`
-   - `gold.close_results_gold`
-   - `gold.forecast_results_gold`
-   - `gold.close_kpi_gold`
-   - All views (`gold.vw_*`)
-5. Paste **General Instructions** from notebook 08 output
-6. Test with query: "Show me close status for December 2025"
+✅ A complete Lakehouse with Bronze/Silver/Gold layers  
+✅ Synthetic financial data for testing  
+✅ 5 intelligent agents automating the close process  
+✅ A Genie space for natural language analytics  
+✅ Helper views ready for dashboard creation  
 
----
+## Next Steps (Optional)
 
-## Step 5: Optional - Create Dashboards (10 minutes)
+### Create Databricks SQL Dashboards (30 minutes)
 
-1. Open **Databricks SQL** workspace
-2. Create **New Dashboard** → "Close Cockpit"
+1. Navigate to **SQL** → **Dashboards** → **Create Dashboard**
+2. Name it "Close Cockpit Dashboard"
 3. Add visualizations using queries from notebook 08:
-   - Gauge: Overall progress
-   - Bar chart: Status by phase
-   - Table: Overdue tasks
-4. Configure auto-refresh (15 min)
-5. Repeat for "Close Results" and "Forecast Analysis" dashboards
+   - Overall Close Progress (counter)
+   - Tasks by Status (pie chart)
+   - Overdue Tasks (table)
+   - Close Timeline (bar chart)
+4. Repeat for other dashboards (Close Results, Forecast, KPI Scorecard)
 
----
-
-## Testing the Solution
-
-### Test 1: Query Close Status
-```sql
--- Via Genie or SQL editor
-SELECT 
-  phase_name, 
-  COUNT(*) as total_tasks,
-  SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed
-FROM gold.close_status_gold
-WHERE period = '2025-12'
-GROUP BY phase_name;
-```
-**Expected:** All phases show 100% completion
-
----
-
-### Test 2: Check Variance Analysis
-```sql
--- Top variances vs forecast
-SELECT 
-  bu_code,
-  account_category,
-  variance_vs_forecast,
-  variance_vs_forecast_pct
-FROM gold.close_results_gold
-WHERE period = '2025-12'
-  AND bu_code != 'CONSOLIDATED'
-  AND segment IS NULL
-ORDER BY ABS(variance_vs_forecast) DESC
-LIMIT 5;
-```
-**Expected:** List of BU-level variances
-
----
-
-### Test 3: Review Agent Logs
-```sql
--- Recent agent actions
-SELECT 
-  agent_name,
-  action_type,
-  decision_rationale,
-  log_timestamp
-FROM gold.close_agent_logs
-WHERE period = '2025-12'
-ORDER BY log_timestamp DESC
-LIMIT 10;
-```
-**Expected:** Log entries from supervisor, FX, pre-close, and reporting agents
-
----
-
-## Automating the Close (Optional)
-
-### Create Databricks Workflow
+### Set Up Workflows for Automation (15 minutes)
 
 1. Navigate to **Workflows** → **Create Job**
-2. Name: "Monthly_Close_Automation"
-3. Add tasks in sequence:
-   
-   **Task 1:** Ingest Data (Parallel)
-   - Notebook: `03_ingest_and_standardize_phase1_2.py`
-   - Notebook: `04_ingest_and_standardize_phase3.py`
-   
-   **Task 2:** Run Supervisor Agent
-   - Notebook: `05_agent_logic_close_supervisor.py`
-   - Depends on: Task 1
-   
-   **Task 3:** Run Domain Agents (Parallel)
-   - Notebook: `06_agent_logic_fx_and_pre_close.py`
-   - Notebook: `07_agent_logic_segmented_and_forecast.py`
-   - Depends on: Task 2
+2. Create "Daily FX Update Job":
+   - Task: Run notebook `06_agent_logic_fx_and_pre_close.py`
+   - Schedule: Daily at 8 AM
+   - Cluster: New job cluster (single node, small)
+3. Create "Hourly Close Monitor":
+   - Task: Run notebook `05_agent_logic_close_supervisor.py`
+   - Schedule: Every hour during close period
+   - Cluster: Existing cluster or new job cluster
 
-4. **Schedule:** Daily at 8 AM during close period (Days 1-12 of each month)
-5. **Alerts:** Email on failure, success notification to FP&A team
-6. **Cluster:** Use existing all-purpose cluster or create job cluster (Standard_DS3_v2)
+### Configure Permissions (10 minutes)
 
----
-
-## Sample Genie Queries to Try
-
-Once your Genie space is set up, try these queries:
-
-```
-1. "Show me close status for December 2025 by phase"
-2. "What tasks are overdue?"
-3. "Show me consolidated P&L for December 2025"
-4. "Which BUs exceeded forecast this month?"
-5. "What's the operating margin for each BU?"
-6. "Explain the top 3 variance drivers"
-7. "What did the Pre-Close Agent flag?"
-8. "How long did the close take?"
-9. "What's our forecast accuracy this month?"
-10. "Show me revenue trend for the last 6 months"
-```
-
----
+1. Navigate to **Catalog** → `financial_close_catalog`
+2. Click **Permissions**
+3. Grant access:
+   ```
+   FP&A Team → SELECT on all schemas
+   Leadership → SELECT on gold_layer
+   Agents Service Principal → ALL PRIVILEGES
+   ```
 
 ## Troubleshooting
 
 ### Issue: "Catalog not found"
-**Solution:** Ensure Unity Catalog is enabled. Run:
-```sql
-SHOW CATALOGS;
-```
-If `financial_close_lakehouse` is missing, re-run notebook 01.
-
----
+**Solution:** Verify Unity Catalog is enabled on your workspace. Check with your admin.
 
 ### Issue: "Permission denied"
-**Solution:** Grant yourself permissions:
-```sql
-GRANT ALL PRIVILEGES ON CATALOG financial_close_lakehouse TO `your.email@company.com`;
+**Solution:** Ensure you have `CREATE CATALOG` privilege. Ask your workspace admin to grant it.
+
+### Issue: Genie not available
+**Solution:** Genie requires Premium/Enterprise tier. Contact Databricks support to enable.
+
+### Issue: Notebooks fail with import errors
+**Solution:** Ensure you're using DBR 13.3 LTS or higher. Update your cluster runtime.
+
+### Issue: Synthetic data looks wrong
+**Solution:** This is expected - it's random synthetic data for demo purposes. Adjust the generation logic in notebook 02 for your needs.
+
+## Common Commands
+
+### Check Your Databricks Runtime
+```python
+print(spark.version)  # Should be 13.3 or higher
 ```
 
----
-
-### Issue: "No data in Gold tables"
-**Solution:** Verify Bronze and Silver tables have data:
+### List All Tables
 ```sql
-SELECT COUNT(*) FROM bronze.fx_rates_raw;
-SELECT COUNT(*) FROM silver.fx_rates_std;
+SHOW TABLES IN financial_close_catalog.gold_layer;
 ```
-If counts are 0, re-run notebooks 02-04.
+
+### Check Table Row Counts
+```sql
+SELECT 
+  'bronze_layer' as layer,
+  'fx_rates_raw' as table_name,
+  COUNT(*) as row_count
+FROM financial_close_catalog.bronze_layer.fx_rates_raw
+UNION ALL
+SELECT 'silver_layer', 'fx_rates_std', COUNT(*) 
+FROM financial_close_catalog.silver_layer.fx_rates_std
+UNION ALL
+SELECT 'gold_layer', 'close_status_gold', COUNT(*) 
+FROM financial_close_catalog.gold_layer.close_status_gold;
+```
+
+### View Agent Logs
+```sql
+SELECT * 
+FROM financial_close_catalog.gold_layer.close_agent_logs
+ORDER BY log_timestamp DESC
+LIMIT 100;
+```
+
+### Reset Everything (Start Over)
+```sql
+-- WARNING: This deletes all data!
+DROP CATALOG IF EXISTS financial_close_catalog CASCADE;
+```
+Then re-run notebook 01 to start fresh.
+
+## Demo Script for Stakeholders
+
+Use this 5-minute demo script to showcase the solution:
+
+1. **Show Genie (2 minutes)**
+   - Ask: "What is the current close status?"
+   - Ask: "Show me the top 3 variance drivers"
+   - Ask: "Which BU has the highest operating margin?"
+
+2. **Show Dashboard (2 minutes)**
+   - Open Close Cockpit dashboard
+   - Point out: task progress, SLA tracking, overdue items
+   - Show consolidated P&L with variance
+
+3. **Show Agent Logs (1 minute)**
+   - Open agent logs table
+   - Show automated actions taken by agents
+   - Highlight anomaly detection, variance analysis
+
+## Tips for Success
+
+### For FP&A Users
+- Bookmark the Genie space for quick access
+- Save your most-used queries in Genie
+- Subscribe to dashboard email reports
+- Use Genie for variance investigation
+
+### For Administrators
+- Set up workspace-level permissions early
+- Create service principal for agent jobs
+- Configure email alerts for agent failures
+- Schedule regular optimization of Delta tables
+
+### For Developers
+- Use the agent logs extensively for debugging
+- Add custom KPIs in notebook 07
+- Extend agent logic for your specific needs
+- Create additional views for custom dashboards
+
+## Production Checklist
+
+Before going live with real data:
+
+- [ ] Update synthetic data generators to real data connectors
+- [ ] Configure proper Unity Catalog permissions
+- [ ] Set up email/Slack notifications in agents
+- [ ] Create Databricks workflows for automation
+- [ ] Set up monitoring and alerting (Azure Monitor)
+- [ ] Document BU submission process and timelines
+- [ ] Train FP&A team on Genie and dashboards
+- [ ] Test disaster recovery procedures
+- [ ] Archive old periods (data retention policy)
+- [ ] Set up nightly optimization jobs for large tables
+
+## Support Resources
+
+- **Documentation:** See `README.md` and `ARCHITECTURE.md`
+- **Sample Queries:** See notebook 08 for dashboard queries
+- **Genie Examples:** Pre-loaded in the Genie space
+- **Databricks Docs:** [docs.databricks.com](https://docs.databricks.com)
+- **Unity Catalog Guide:** [Unity Catalog Best Practices](https://docs.databricks.com/data-governance/unity-catalog/best-practices.html)
+
+## Performance Optimization
+
+If you experience slow queries as data grows:
+
+1. **Optimize tables monthly:**
+   ```sql
+   OPTIMIZE financial_close_catalog.gold_layer.close_results_gold
+   ZORDER BY (period, bu, segment);
+   ```
+
+2. **Vacuum old versions quarterly:**
+   ```sql
+   VACUUM financial_close_catalog.gold_layer.close_results_gold RETAIN 168 HOURS;
+   ```
+
+3. **Enable Photon acceleration** in cluster configuration
+
+4. **Use Liquid Clustering** for very large tables (100+ GB)
+
+## Customization Ideas
+
+- Add custom KPIs specific to your business
+- Create BU-specific dashboards with row-level security
+- Integrate with your ERP for automated data loading
+- Add machine learning for anomaly detection (Advanced)
+- Implement predictive analytics for cycle time (Advanced)
+- Build Slack bot for close status updates
+- Create mobile-friendly dashboards
+
+## FAQ
+
+**Q: Can I use this with multiple legal entities?**  
+A: Yes! Add a `legal_entity` column to your tables and adjust partitioning.
+
+**Q: How do I add more BUs?**  
+A: Update the `BUSINESS_UNITS` list in notebook 02 and regenerate data.
+
+**Q: Can I customize the close phases?**  
+A: Yes! Modify the phase definitions in notebook 03 and adjust agent logic.
+
+**Q: How much does this cost to run?**  
+A: For 5 BUs with small clusters, expect ~$50-100/month in Databricks costs during active close periods.
+
+**Q: Can this handle real-time close monitoring?**  
+A: Yes! Set agents to run every 15-30 minutes during close periods.
 
 ---
 
-### Issue: "Genie returns 'no results'"
-**Solution:** 
-1. Check table permissions in Genie space settings
-2. Verify tables are added to the space
-3. Try a simpler query: "Show me tables in gold schema"
+**Need Help?**  
+- Check the `ARCHITECTURE.md` for detailed technical documentation
+- Review agent logs for troubleshooting
+- Consult Databricks documentation for platform questions
 
----
-
-## Next Steps After Setup
-
-1. **Customize for your organization:**
-   - Update BU list in `config.business_units`
-   - Modify account structure in notebook 02
-   - Adjust close phase tasks in `config.close_phase_definitions`
-
-2. **Integrate real data sources:**
-   - Replace notebook 02 with Auto Loader for real files
-   - Connect to SAP/Oracle via JDBC for trial balance
-   - Pull FX rates from Bloomberg/Reuters APIs
-
-3. **Enhance agents:**
-   - Add ML-based anomaly detection
-   - Implement forecast automation
-   - Create NLP summaries of review meetings
-
-4. **Train your team:**
-   - Schedule demo session
-   - Create Genie cheat sheet
-   - Document custom business rules
-
----
-
-## Support and Resources
-
-### Documentation
-- **Architecture:** See `README.md`
-- **Notebooks:** Inline comments in each notebook
-- **Genie:** Instructions in notebook 08 output
-
-### Getting Help
-- **Databricks Issues:** Contact your Databricks account team
-- **Solution Questions:** Review agent logs in `gold.close_agent_logs`
-- **Data Quality:** Check Bronze/Silver validation steps
-
-### Community
-- Share your success story with the Databricks community
-- Contribute enhancements back to this repo
-- Connect with other FP&A teams using Databricks
-
----
-
-## Success Criteria
-
-You've successfully deployed the solution when:
-
-✅ All notebooks run without errors  
-✅ Gold tables contain data for period 2025-12  
-✅ All close phases show 100% completion  
-✅ Agent logs show decisions and actions  
-✅ SQL queries return expected results  
-✅ Genie space answers questions correctly  
-✅ Dashboards display charts and metrics  
-
-**Congratulations! You now have an intelligent financial close solution running on Azure Databricks.** 🎉
-
----
-
-## Estimated Timeline
-
-| Step | Time | Cumulative |
-|------|------|------------|
-| Upload notebooks | 5 min | 5 min |
-| Run setup (notebooks 01-04) | 15 min | 20 min |
-| Run agent notebooks (05-07) | 5 min | 25 min |
-| Verify installation | 5 min | 30 min |
-| **TOTAL** | **30 min** | **Ready to use** |
-
-*Optional steps (Genie + Dashboards): +15 minutes*
-
----
-
-For detailed architecture and design decisions, see the main `README.md`.
+**Happy Closing!** 🎉

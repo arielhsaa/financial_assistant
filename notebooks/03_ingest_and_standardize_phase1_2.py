@@ -1,556 +1,482 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Financial Close - Phase 1 & 2 Data Processing
+# MAGIC # Financial Close - Phase 1 & 2 Data Ingestion and Standardization
 # MAGIC 
-# MAGIC **Purpose:** Ingest and standardize data for Phase 1 (Data Gathering) and Phase 2 (Adjustments)
+# MAGIC This notebook processes Bronze data for **Phase 1 (Data Gathering)** and **Phase 2 (Adjustments)**:
+# MAGIC - Standardizes FX rates to Silver (`fx_rates_std`)
+# MAGIC - Standardizes trial balance to Silver (`close_trial_balance_std`)
+# MAGIC - Updates task tracking in Gold (`close_phase_tasks`)
+# MAGIC - Updates close status in Gold (`close_status_gold`)
 # MAGIC 
-# MAGIC **Processes:**
-# MAGIC - FX rates: Bronze → Silver (validation, deduplication, quality scoring)
-# MAGIC - BU preliminary close: Bronze → Silver (standardization, FX conversion)
-# MAGIC - Populate Gold: close_status_gold for Phase 1 & 2 tasks
-# MAGIC 
-# MAGIC **Execution time:** ~3 minutes
+# MAGIC **Run this notebook** after generating synthetic data or receiving new BU submissions.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Setup
+# MAGIC ## Configuration
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
 from pyspark.sql.window import Window
 from datetime import datetime, timedelta
 import json
 
-spark.sql("USE CATALOG financial_close_lakehouse")
+# Catalog and schema configuration
+CATALOG = "financial_close_catalog"
+BRONZE_SCHEMA = "bronze_layer"
+SILVER_SCHEMA = "silver_layer"
+GOLD_SCHEMA = "gold_layer"
 
-# Configuration
-REPORTING_CURRENCY = "USD"
-CURRENT_PERIOD = "2025-12"  # December 2025 close
+# Period to process
+CURRENT_PERIOD = 202601  # January 2026
 
-print(f"✓ Processing close for period: {CURRENT_PERIOD}")
-print(f"✓ Reporting currency: {REPORTING_CURRENCY}")
+print(f"Processing Phase 1 & 2 data for period: {CURRENT_PERIOD}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Process FX Rates (Bronze → Silver)
+# MAGIC ## 1. Standardize FX Rates (Phase 1)
 
 # COMMAND ----------
+
+print("Standardizing FX rates...")
 
 # Read raw FX rates
-fx_raw = spark.table("bronze.fx_rates_raw")
+fx_raw = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.fx_rates_raw")
 
-print(f"Raw FX records: {fx_raw.count()}")
+# Calculate data quality score and detect anomalies
+fx_window = Window.partitionBy("from_currency", "to_currency").orderBy("rate_date")
 
-# COMMAND ----------
-
-# Standardize and validate FX rates
-# Strategy: For each date/currency pair, pick the median rate across providers
-# Flag as latest if it's from the most recent load
-
-fx_standardized = (
-    fx_raw
-    # Filter to valid rates (positive, reasonable range)
-    .filter(F.col("rate") > 0)
-    .filter(F.col("rate") < 1000)  # Catch data errors
-    
-    # Calculate median rate per date/currency pair
-    .groupBy("rate_date", "base_currency", "quote_currency", "rate_type")
-    .agg(
-        F.expr("percentile(rate, 0.5)").alias("rate"),  # Median rate
-        F.count("*").alias("provider_count"),
-        F.min("rate").alias("min_rate"),
-        F.max("rate").alias("max_rate"),
-        F.max("load_timestamp").alias("load_timestamp")
-    )
-    
-    # Calculate quality score based on provider consensus
-    .withColumn("rate_spread", F.col("max_rate") - F.col("min_rate"))
-    .withColumn("quality_score", 
-                F.when(F.col("rate_spread") / F.col("rate") < 0.01, 1.0)  # <1% spread = perfect
-                 .when(F.col("rate_spread") / F.col("rate") < 0.02, 0.9)  # <2% spread = good
-                 .otherwise(0.7))  # >2% spread = acceptable
-    
-    # Flag latest rate for each date/currency
-    .withColumn("is_latest", F.lit(True))
-    
-    # Add audit columns
-    .withColumn("created_at", F.current_timestamp())
-    .withColumn("updated_at", F.current_timestamp())
-    
-    # Select columns for silver table
+fx_std = fx_raw \
+    .withColumn("prev_rate", lag("exchange_rate").over(fx_window)) \
+    .withColumn("rate_change_pct", 
+                when(col("prev_rate").isNotNull(), 
+                     (col("exchange_rate") - col("prev_rate")) / col("prev_rate") * 100)
+                .otherwise(0)) \
+    .withColumn("anomaly_flag", 
+                when(abs(col("rate_change_pct")) > 5.0, True)  # >5% daily change = anomaly
+                .otherwise(False)) \
+    .withColumn("data_quality_score", 
+                when(col("anomaly_flag"), 0.80)
+                .otherwise(1.0)) \
+    .withColumn("is_latest", 
+                row_number().over(
+                    Window.partitionBy("rate_date", "from_currency", "to_currency")
+                    .orderBy(desc("load_timestamp"))
+                ) == 1) \
     .select(
         "rate_date",
-        "base_currency",
-        "quote_currency",
-        "rate",
+        "from_currency",
+        "to_currency",
+        "exchange_rate",
         "rate_type",
         "is_latest",
-        "quality_score",
-        F.concat_ws(",", F.lit("multiple")).alias("source_provider"),
-        "created_at",
-        "updated_at"
+        "provider",
+        col("load_timestamp"),
+        "data_quality_score",
+        "anomaly_flag",
+        "metadata"
     )
-)
 
-# Write to Silver
-fx_standardized.write.mode("overwrite").saveAsTable("silver.fx_rates_std")
+# Write to Silver (overwrite for idempotency)
+fx_std.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{SILVER_SCHEMA}.fx_rates_std")
 
-fx_count = fx_standardized.count()
-print(f"✓ Processed {fx_count} standardized FX rates")
+fx_count = fx_std.count()
+anomaly_count = fx_std.filter(col("anomaly_flag") == True).count()
 
-# Show quality metrics
-fx_quality = fx_standardized.groupBy("quality_score").count().orderBy("quality_score", ascending=False)
-print("\nFX Quality Distribution:")
-display(fx_quality)
+print(f"✓ Standardized {fx_count:,} FX rate records")
+print(f"  - Anomalies detected: {anomaly_count}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Process BU Preliminary Close (Bronze → Silver)
+# MAGIC ## 2. Standardize Trial Balance (Phase 2)
 
 # COMMAND ----------
 
-# Read raw preliminary close data
-pre_close_raw = spark.table("bronze.bu_pre_close_raw")
+print("Standardizing trial balance...")
 
-print(f"Raw preliminary close records: {pre_close_raw.count()}")
+# Read raw pre-close data
+pre_close_raw = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.bu_pre_close_raw") \
+    .filter(col("period") == CURRENT_PERIOD)
 
-# COMMAND ----------
+# Map account codes to categories
+account_category_map = {
+    "4000": "Revenue", "4100": "Revenue",
+    "5000": "COGS", "5100": "COGS",
+    "6000": "Operating Expense", "6100": "Operating Expense", 
+    "6200": "Operating Expense", "7000": "Operating Expense",
+    "8000": "Other"
+}
 
-# Get latest FX rates for the period
-# Strategy: Use month-end rate for the close period
-from pyspark.sql.functions import last_day
+# Create mapping expression
+category_expr = when(col("account_code") == "4000", "Revenue") \
+    .when(col("account_code") == "4100", "Revenue") \
+    .when(col("account_code") == "5000", "COGS") \
+    .when(col("account_code") == "5100", "COGS") \
+    .when(col("account_code").startswith("6"), "Operating Expense") \
+    .when(col("account_code") == "7000", "Operating Expense") \
+    .otherwise("Other")
 
-period_end_date = F.last_day(F.lit(f"{CURRENT_PERIOD}-01"))
+# Assign version number within each cut type
+cut_version_window = Window.partitionBy("period", "bu", "cut_type", "account_code", "cost_center") \
+    .orderBy("load_timestamp")
 
-# Get FX rates for month-end
-fx_rates_for_period = (
-    spark.table("silver.fx_rates_std")
-    .filter(F.col("rate_date") == F.last_day(F.lit(f"{CURRENT_PERIOD}-01")))
-    .select(
-        "quote_currency",
-        F.col("rate").alias("fx_rate")
-    )
-)
-
-print("FX rates for period:")
-display(fx_rates_for_period)
-
-# COMMAND ----------
-
-# Standardize trial balance with FX conversion
-trial_balance_std = (
-    pre_close_raw
-    .filter(F.col("period") == CURRENT_PERIOD)
-    
-    # Add account category mapping (already in raw data, but validate)
-    .withColumn("account_category",
-                F.when(F.col("account_code").startswith("4"), "Revenue")
-                 .when(F.col("account_code").startswith("5"), "COGS")
-                 .when(F.col("account_code").startswith("6"), "OpEx")
-                 .when(F.col("account_code").startswith("7"), "OpEx")
-                 .when(F.col("account_code").startswith("8"), "Interest")
-                 .when(F.col("account_code").startswith("9"), "Tax")
-                 .otherwise("Other"))
-    
-    # Add version timestamp (simulate receipt times)
-    .withColumn("version_timestamp",
-                F.when(F.col("cut_version") == "preliminary", F.lit("2025-12-03 10:00:00").cast("timestamp"))
-                 .when(F.col("cut_version") == "cut1", F.lit("2025-12-06 14:00:00").cast("timestamp"))
-                 .when(F.col("cut_version") == "cut2", F.lit("2025-12-10 16:00:00").cast("timestamp"))
-                 .otherwise(F.current_timestamp()))
-    
-    # Join with FX rates for conversion
-    .join(fx_rates_for_period, 
-          F.col("local_currency") == F.col("quote_currency"), 
-          "left")
-    
-    # Handle USD (no conversion needed)
-    .withColumn("fx_rate", F.coalesce(F.col("fx_rate"), F.lit(1.0)))
-    
-    # Convert to reporting currency
-    .withColumn("reporting_currency", F.lit(REPORTING_CURRENCY))
-    .withColumn("reporting_amount", F.col("local_amount") / F.col("fx_rate"))
-    
-    # Flag current version (cut2 is final)
-    .withColumn("is_current_version",
-                F.when(F.col("cut_version") == "cut2", True).otherwise(False))
-    
-    # Add audit columns
-    .withColumn("created_at", F.current_timestamp())
-    .withColumn("updated_at", F.current_timestamp())
-    
+# Calculate variance vs. prior period (simplified - using random for demo)
+tb_std = pre_close_raw \
+    .withColumn("account_category", category_expr) \
+    .withColumn("cut_version", row_number().over(cut_version_window)) \
+    .withColumn("fx_rate", col("reporting_amount") / col("local_amount")) \
+    .withColumn("fx_impact", lit(0.0))  # Simplified for demo - would calculate vs. prior period rate \
+    .withColumn("variance_vs_prior_pct", 
+                (rand() - 0.5) * 20)  # Random variance for demo \
+    .withColumn("data_quality_flag", 
+                when((col("local_amount") == 0) & (col("reporting_amount") != 0), "FAIL")
+                .when(abs(col("variance_vs_prior_pct")) > 50, "WARN")
+                .otherwise("PASS")) \
     .select(
         "period",
-        "bu_code",
+        "bu",
+        "cut_type",
         "cut_version",
-        "version_timestamp",
         "account_code",
         "account_name",
         "account_category",
         "cost_center",
         "segment",
+        "region",
         "local_currency",
         "local_amount",
         "reporting_currency",
         "reporting_amount",
         "fx_rate",
-        "is_current_version",
-        "created_at",
-        "updated_at"
+        "fx_impact",
+        col("load_timestamp"),
+        "data_quality_flag",
+        "variance_vs_prior_pct",
+        "metadata"
     )
-)
 
 # Write to Silver
-trial_balance_std.write.mode("append").saveAsTable("silver.close_trial_balance_std")
+tb_std.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{SILVER_SCHEMA}.close_trial_balance_std")
 
-tb_count = trial_balance_std.count()
-print(f"✓ Processed {tb_count} trial balance records")
+tb_count = tb_std.count()
+quality_issues = tb_std.filter(col("data_quality_flag").isin(["WARN", "FAIL"])).count()
 
-# Show summary by BU and version
-tb_summary = (
-    trial_balance_std
-    .groupBy("bu_code", "cut_version")
+print(f"✓ Standardized {tb_count:,} trial balance records")
+print(f"  - Data quality issues: {quality_issues}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Initialize Phase Tasks (Phase 1 & 2)
+
+# COMMAND ----------
+
+print("Initializing phase tasks...")
+
+# Define Phase 1 and Phase 2 tasks
+tasks_data = [
+    # Phase 1 - Data Gathering
+    {"period": CURRENT_PERIOD, "phase_id": 1, "phase_name": "Data Gathering", 
+     "task_id": "P1-T1", "task_name": "Receive and upload exchange rates", 
+     "bu": None, "owner_role": "Treasury", "planned_due_date": datetime(2026, 2, 1, 12, 0),
+     "status": "completed", "priority": "high", "agent_assigned": "FX Agent"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 1, "phase_name": "Data Gathering",
+     "task_id": "P1-T2", "task_name": "Process exchange rates in Databricks",
+     "bu": None, "owner_role": "FP&A Tech", "planned_due_date": datetime(2026, 2, 1, 14, 0),
+     "status": "completed", "priority": "high", "agent_assigned": "FX Agent"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 1, "phase_name": "Data Gathering",
+     "task_id": "P1-T3-NA", "task_name": "Receive BU preliminary close files",
+     "bu": "North America", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 2, 17, 0),
+     "status": "completed", "priority": "critical", "agent_assigned": None},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 1, "phase_name": "Data Gathering",
+     "task_id": "P1-T3-EU", "task_name": "Receive BU preliminary close files",
+     "bu": "Europe", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 2, 17, 0),
+     "status": "completed", "priority": "critical", "agent_assigned": None},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 1, "phase_name": "Data Gathering",
+     "task_id": "P1-T3-AP", "task_name": "Receive BU preliminary close files",
+     "bu": "Asia Pacific", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 2, 17, 0),
+     "status": "completed", "priority": "critical", "agent_assigned": None},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 1, "phase_name": "Data Gathering",
+     "task_id": "P1-T3-LA", "task_name": "Receive BU preliminary close files",
+     "bu": "Latin America", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 2, 17, 0),
+     "status": "completed", "priority": "critical", "agent_assigned": None},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 1, "phase_name": "Data Gathering",
+     "task_id": "P1-T3-ME", "task_name": "Receive BU preliminary close files",
+     "bu": "Middle East", "owner_role": "BU Controller", "planned_due_date": datetime(2026, 2, 2, 17, 0),
+     "status": "completed", "priority": "critical", "agent_assigned": None},
+    
+    # Phase 2 - Adjustments
+    {"period": CURRENT_PERIOD, "phase_id": 2, "phase_name": "Adjustments",
+     "task_id": "P2-T1", "task_name": "Process BU preliminary close files",
+     "bu": None, "owner_role": "FP&A Tech", "planned_due_date": datetime(2026, 2, 3, 12, 0),
+     "status": "completed", "priority": "high", "agent_assigned": "PreClose Agent"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 2, "phase_name": "Adjustments",
+     "task_id": "P2-T2", "task_name": "Publish preliminary results",
+     "bu": None, "owner_role": "FP&A", "planned_due_date": datetime(2026, 2, 3, 17, 0),
+     "status": "in_progress", "priority": "high", "agent_assigned": "PreClose Agent"},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 2, "phase_name": "Adjustments",
+     "task_id": "P2-T3", "task_name": "Preliminary results review meeting (FP&A + Tech)",
+     "bu": None, "owner_role": "FP&A Lead", "planned_due_date": datetime(2026, 2, 4, 10, 0),
+     "status": "pending", "priority": "high", "agent_assigned": None},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 2, "phase_name": "Adjustments",
+     "task_id": "P2-T4", "task_name": "Receive first accounting cut",
+     "bu": None, "owner_role": "Accounting", "planned_due_date": datetime(2026, 2, 5, 17, 0),
+     "status": "pending", "priority": "high", "agent_assigned": None},
+    
+    {"period": CURRENT_PERIOD, "phase_id": 2, "phase_name": "Adjustments",
+     "task_id": "P2-T5", "task_name": "Receive second (final) accounting cut",
+     "bu": None, "owner_role": "Accounting", "planned_due_date": datetime(2026, 2, 6, 17, 0),
+     "status": "pending", "priority": "critical", "agent_assigned": None},
+]
+
+# Add common fields
+for task in tasks_data:
+    task["actual_start_timestamp"] = datetime.now() if task["status"] in ["completed", "in_progress"] else None
+    task["actual_completion_timestamp"] = datetime.now() if task["status"] == "completed" else None
+    task["blocking_reason"] = None
+    task["comments"] = None
+    task["dependencies"] = None
+    task["last_updated_timestamp"] = datetime.now()
+    task["metadata"] = json.dumps({"created_by": "system", "auto_generated": True})
+
+# Create DataFrame and write to Gold
+tasks_df = spark.createDataFrame(tasks_data)
+tasks_df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks")
+
+print(f"✓ Initialized {len(tasks_data)} phase tasks")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Update Close Status
+
+# COMMAND ----------
+
+print("Updating close status...")
+
+# Calculate status by BU
+bu_status = tasks_df \
+    .filter(col("bu").isNotNull()) \
+    .groupBy("period", "bu") \
     .agg(
-        F.sum("reporting_amount").alias("total_amount"),
-        F.count("*").alias("record_count")
-    )
-    .orderBy("bu_code", "cut_version")
-)
+        max("phase_id").alias("phase_id"),
+        max("phase_name").alias("phase_name"),
+        count("*").alias("total_tasks"),
+        sum(when(col("status") == "completed", 1).otherwise(0)).alias("completed_tasks"),
+        sum(when(col("status") == "blocked", 1).otherwise(0)).alias("blocked_tasks")
+    ) \
+    .withColumn("pct_tasks_completed", 
+                round(col("completed_tasks") / col("total_tasks") * 100, 2)) \
+    .withColumn("overall_status",
+                when(col("pct_tasks_completed") == 100, "completed")
+                .when(col("blocked_tasks") > 0, "issues")
+                .when(col("completed_tasks") > 0, "in_progress")
+                .otherwise("not_started")) \
+    .withColumn("days_since_period_end", lit(3))  # Simplified for demo \
+    .withColumn("days_to_sla", lit(7))  # Simplified: 10 day SLA, 3 days elapsed \
+    .withColumn("sla_status",
+                when(col("days_to_sla") < 2, "at_risk")
+                .when(col("days_to_sla") < 0, "overdue")
+                .otherwise("on_track")) \
+    .withColumn("key_issues", lit(None).cast("string")) \
+    .withColumn("last_milestone", lit("Preliminary close data received")) \
+    .withColumn("next_milestone", lit("Preliminary results review meeting")) \
+    .withColumn("agent_summary", 
+                concat(
+                    lit("BU "), col("bu"), 
+                    lit(" has completed "), col("pct_tasks_completed"), 
+                    lit("% of tasks in Phase "), col("phase_id")
+                )) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"source": "phase1_2_processing"}'))
 
-print("\nTrial Balance Summary by BU and Version:")
-display(tb_summary)
+# Add consolidated status
+consolidated_status = tasks_df \
+    .groupBy("period") \
+    .agg(
+        max("phase_id").alias("phase_id"),
+        max("phase_name").alias("phase_name"),
+        count("*").alias("total_tasks"),
+        sum(when(col("status") == "completed", 1).otherwise(0)).alias("completed_tasks"),
+        sum(when(col("status") == "blocked", 1).otherwise(0)).alias("blocked_tasks")
+    ) \
+    .withColumn("bu", lit("CONSOLIDATED")) \
+    .withColumn("pct_tasks_completed", 
+                round(col("completed_tasks") / col("total_tasks") * 100, 2)) \
+    .withColumn("overall_status",
+                when(col("pct_tasks_completed") == 100, "completed")
+                .when(col("blocked_tasks") > 0, "issues")
+                .when(col("completed_tasks") > 0, "in_progress")
+                .otherwise("not_started")) \
+    .withColumn("days_since_period_end", lit(3)) \
+    .withColumn("days_to_sla", lit(7)) \
+    .withColumn("sla_status", lit("on_track")) \
+    .withColumn("key_issues", lit(None).cast("string")) \
+    .withColumn("last_milestone", lit("Trial balance standardization completed")) \
+    .withColumn("next_milestone", lit("Preliminary results review meeting")) \
+    .withColumn("agent_summary", 
+                concat(
+                    lit("Overall close progress: "), 
+                    col("pct_tasks_completed"), 
+                    lit("% complete. Currently in Phase "), 
+                    col("phase_id"), lit(" - "), col("phase_name")
+                )) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"source": "phase1_2_processing"}'))
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 3. Calculate Preliminary KPIs
-
-# COMMAND ----------
-
-# Calculate key metrics by BU for preliminary review
-preliminary_kpis = (
-    trial_balance_std
-    .filter(F.col("cut_version") == "cut2")  # Final cut
-    .groupBy("bu_code", "account_category")
-    .agg(F.sum("reporting_amount").alias("total_amount"))
-    .groupBy("bu_code")
-    .pivot("account_category", ["Revenue", "COGS", "OpEx", "Interest", "Tax"])
-    .sum("total_amount")
-    .fillna(0)
-    
-    # Calculate operating profit
-    .withColumn("Operating_Profit", 
-                F.col("Revenue") + F.col("COGS") + F.col("OpEx"))
-    
-    # Calculate operating margin
-    .withColumn("Operating_Margin_Pct",
-                F.round((F.col("Operating_Profit") / F.col("Revenue")) * 100, 2))
-)
-
-print("Preliminary KPIs by BU:")
-display(preliminary_kpis)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4. Populate Close Status (Gold)
-
-# COMMAND ----------
-
-# Get business units and phase definitions
-bus = spark.table("config.business_units").select("bu_code").collect()
-bu_codes = [row.bu_code for row in bus]
-
-phase_tasks = spark.table("config.close_phase_definitions").collect()
-
-# COMMAND ----------
-
-# Generate close status records for Phase 1 & 2
-# Simulate realistic completion times
-
-status_records = []
-
-# Phase 1 tasks (Days 1-2 of close)
-phase1_tasks = [t for t in phase_tasks if t.phase_id == 1]
-for task in phase1_tasks:
-    if task.is_bu_specific:
-        # Create one task per BU
-        for bu_code in bu_codes:
-            status_records.append({
-                "period": CURRENT_PERIOD,
-                "phase_id": task.phase_id,
-                "phase_name": task.phase_name,
-                "task_id": task.task_id,
-                "task_name": task.task_name,
-                "bu_code": bu_code,
-                "planned_due_date": f"2025-12-02",  # Day 2 of close
-                "actual_completion_timestamp": datetime(2025, 12, 2, 14, 30, 0),
-                "status": "completed",
-                "owner_role": task.owner_role,
-                "comments": f"FX Agent: Completed automatically. Quality score: 0.98",
-                "last_updated_by": "fx_agent",
-                "created_at": datetime.now(),
-                "updated_at": datetime.now()
-            })
-    else:
-        # Group-level task
-        status_records.append({
-            "period": CURRENT_PERIOD,
-            "phase_id": task.phase_id,
-            "phase_name": task.phase_name,
-            "task_id": task.task_id,
-            "task_name": task.task_name,
-            "bu_code": None,
-            "planned_due_date": f"2025-12-02",
-            "actual_completion_timestamp": datetime(2025, 12, 2, 10, 0, 0) if task.task_id == 101 else datetime(2025, 12, 2, 12, 0, 0),
-            "status": "completed",
-            "owner_role": task.owner_role,
-            "comments": f"Completed. All required currencies present." if task.task_id == 102 else "Files received from all providers.",
-            "last_updated_by": "fx_agent" if task.task_id <= 102 else "pre_close_agent",
-            "created_at": datetime.now(),
-            "updated_at": datetime.now()
-        })
-
-# Phase 2 tasks (Days 3-7 of close)
-phase2_tasks = [t for t in phase_tasks if t.phase_id == 2]
-for task in phase2_tasks:
-    if task.is_bu_specific:
-        # Create one task per BU
-        for bu_code in bu_codes:
-            # Simulate different completion times per BU
-            if task.task_id == 204:  # First cut
-                completion = datetime(2025, 12, 6, 14, 0, 0)
-                task_status = "completed"
-            elif task.task_id == 205:  # Final cut
-                completion = datetime(2025, 12, 10, 16, 0, 0)
-                task_status = "completed"
-            else:
-                completion = None
-                task_status = "pending"
-            
-            status_records.append({
-                "period": CURRENT_PERIOD,
-                "phase_id": task.phase_id,
-                "phase_name": task.phase_name,
-                "task_id": task.task_id,
-                "task_name": task.task_name,
-                "bu_code": bu_code,
-                "planned_due_date": f"2025-12-{task.task_id - 195}",  # Day 6, 10, etc.
-                "actual_completion_timestamp": completion,
-                "status": task_status,
-                "owner_role": task.owner_role,
-                "comments": f"Completed with {random.randint(5, 25)} adjustment entries" if task_status == "completed" else None,
-                "last_updated_by": "pre_close_agent" if task_status == "completed" else None,
-                "created_at": datetime.now(),
-                "updated_at": datetime.now()
-            })
-    else:
-        # Group-level tasks
-        if task.task_id == 201:  # Process preliminary
-            completion = datetime(2025, 12, 4, 10, 0, 0)
-            task_status = "completed"
-            comments = f"Processed {tb_count} records. {len(bu_codes)} BUs included."
-        elif task.task_id == 202:  # Publish preliminary
-            completion = datetime(2025, 12, 4, 14, 0, 0)
-            task_status = "completed"
-            comments = "Preliminary results available in Gold layer."
-        elif task.task_id == 203:  # Review meeting
-            completion = datetime(2025, 12, 5, 15, 0, 0)
-            task_status = "completed"
-            comments = "Meeting completed. Action items: Review BU Asia variance (15% below plan)."
-        else:
-            completion = None
-            task_status = "pending"
-            comments = None
-        
-        status_records.append({
-            "period": CURRENT_PERIOD,
-            "phase_id": task.phase_id,
-            "phase_name": task.phase_name,
-            "task_id": task.task_id,
-            "task_name": task.task_name,
-            "bu_code": None,
-            "planned_due_date": f"2025-12-{task.task_id - 197}",
-            "actual_completion_timestamp": completion,
-            "status": task_status,
-            "owner_role": task.owner_role,
-            "comments": comments,
-            "last_updated_by": "pre_close_agent" if task_status == "completed" else None,
-            "created_at": datetime.now(),
-            "updated_at": datetime.now()
-        })
-
-# COMMAND ----------
-
-import random  # Need for random adjustments count
-
-# Recreate status_records with proper random import
-status_records = []
-
-# Phase 1 tasks (Days 1-2 of close)
-phase1_tasks = [t for t in phase_tasks if t.phase_id == 1]
-for task in phase1_tasks:
-    if task.is_bu_specific:
-        for bu_code in bu_codes:
-            status_records.append({
-                "period": CURRENT_PERIOD,
-                "phase_id": task.phase_id,
-                "phase_name": task.phase_name,
-                "task_id": task.task_id,
-                "task_name": task.task_name,
-                "bu_code": bu_code,
-                "planned_due_date": "2025-12-02",
-                "actual_completion_timestamp": datetime(2025, 12, 2, 14, 30, 0),
-                "status": "completed",
-                "owner_role": task.owner_role,
-                "comments": f"FX Agent: Completed automatically. Quality score: 0.98",
-                "last_updated_by": "fx_agent",
-                "created_at": datetime.now(),
-                "updated_at": datetime.now()
-            })
-    else:
-        status_records.append({
-            "period": CURRENT_PERIOD,
-            "phase_id": task.phase_id,
-            "phase_name": task.phase_name,
-            "task_id": task.task_id,
-            "task_name": task.task_name,
-            "bu_code": None,
-            "planned_due_date": "2025-12-02",
-            "actual_completion_timestamp": datetime(2025, 12, 2, 10, 0, 0) if task.task_id == 101 else datetime(2025, 12, 2, 12, 0, 0),
-            "status": "completed",
-            "owner_role": task.owner_role,
-            "comments": f"Completed. All required currencies present." if task.task_id == 102 else "Files received from all providers.",
-            "last_updated_by": "fx_agent" if task.task_id <= 102 else "pre_close_agent",
-            "created_at": datetime.now(),
-            "updated_at": datetime.now()
-        })
-
-# Phase 2 tasks (Days 3-7 of close)
-phase2_tasks = [t for t in phase_tasks if t.phase_id == 2]
-for task in phase2_tasks:
-    if task.is_bu_specific:
-        for bu_code in bu_codes:
-            if task.task_id == 204:
-                completion = datetime(2025, 12, 6, 14, 0, 0)
-                task_status = "completed"
-            elif task.task_id == 205:
-                completion = datetime(2025, 12, 10, 16, 0, 0)
-                task_status = "completed"
-            else:
-                completion = None
-                task_status = "pending"
-            
-            status_records.append({
-                "period": CURRENT_PERIOD,
-                "phase_id": task.phase_id,
-                "phase_name": task.phase_name,
-                "task_id": task.task_id,
-                "task_name": task.task_name,
-                "bu_code": bu_code,
-                "planned_due_date": f"2025-12-{6 if task.task_id == 204 else 10}",
-                "actual_completion_timestamp": completion,
-                "status": task_status,
-                "owner_role": task.owner_role,
-                "comments": f"Completed with {random.randint(5, 25)} adjustment entries" if task_status == "completed" else None,
-                "last_updated_by": "pre_close_agent" if task_status == "completed" else None,
-                "created_at": datetime.now(),
-                "updated_at": datetime.now()
-            })
-    else:
-        if task.task_id == 201:
-            completion = datetime(2025, 12, 4, 10, 0, 0)
-            task_status = "completed"
-            comments = f"Processed {tb_count} records. {len(bu_codes)} BUs included."
-        elif task.task_id == 202:
-            completion = datetime(2025, 12, 4, 14, 0, 0)
-            task_status = "completed"
-            comments = "Preliminary results available in Gold layer."
-        elif task.task_id == 203:
-            completion = datetime(2025, 12, 5, 15, 0, 0)
-            task_status = "completed"
-            comments = "Meeting completed. Action items: Review BU Asia variance (15% below plan)."
-        else:
-            completion = None
-            task_status = "pending"
-            comments = None
-        
-        status_records.append({
-            "period": CURRENT_PERIOD,
-            "phase_id": task.phase_id,
-            "phase_name": task.phase_name,
-            "task_id": task.task_id,
-            "task_name": task.task_name,
-            "bu_code": None,
-            "planned_due_date": f"2025-12-{4 if task.task_id == 201 else 5 if task.task_id in [202, 203] else 7}",
-            "actual_completion_timestamp": completion,
-            "status": task_status,
-            "owner_role": task.owner_role,
-            "comments": comments,
-            "last_updated_by": "pre_close_agent" if task_status == "completed" else None,
-            "created_at": datetime.now(),
-            "updated_at": datetime.now()
-        })
+# Union BU and consolidated status
+all_status = bu_status.union(consolidated_status)
 
 # Write to Gold
-status_df = spark.createDataFrame(status_records)
-status_df.write.mode("append").saveAsTable("gold.close_status_gold")
+all_status.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_status_gold")
 
-print(f"✓ Created {len(status_records)} close status records for Phase 1 & 2")
+status_count = all_status.count()
+print(f"✓ Updated close status for {status_count} entities")
 
 # COMMAND ----------
 
-# Show status summary
-status_summary = (
-    status_df
+# MAGIC %md
+# MAGIC ## 5. Calculate Preliminary KPIs
+
+# COMMAND ----------
+
+print("Calculating preliminary KPIs...")
+
+# Calculate KPIs from trial balance
+kpi_data = []
+
+# Get final_cut data (or latest available)
+final_tb = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.close_trial_balance_std") \
+    .filter((col("period") == CURRENT_PERIOD) & (col("cut_type") == "final_cut"))
+
+# If no final_cut yet, use preliminary
+if final_tb.count() == 0:
+    final_tb = spark.table(f"{CATALOG}.{SILVER_SCHEMA}.close_trial_balance_std") \
+        .filter((col("period") == CURRENT_PERIOD) & (col("cut_type") == "preliminary"))
+
+# KPI 1: Total Revenue by BU
+revenue_by_bu = final_tb \
+    .filter(col("account_category") == "Revenue") \
+    .groupBy("bu") \
+    .agg(sum("reporting_amount").alias("kpi_value")) \
+    .withColumn("period", lit(CURRENT_PERIOD)) \
+    .withColumn("kpi_name", lit("Total Revenue")) \
+    .withColumn("kpi_category", lit("Financial")) \
+    .withColumn("kpi_unit", lit("currency")) \
+    .withColumn("target_value", col("kpi_value") * 0.95)  # Target = 95% of actual for demo \
+    .withColumn("variance_vs_target", col("kpi_value") - col("target_value")) \
+    .withColumn("status", lit("on_target")) \
+    .withColumn("trend", lit("stable")) \
+    .withColumn("description", lit("Total revenue in reporting currency")) \
+    .withColumn("load_timestamp", current_timestamp()) \
+    .withColumn("metadata", lit('{"preliminary": true}'))
+
+# Write to Gold
+revenue_by_bu.select(
+    "period", "kpi_name", "kpi_category", "bu", "kpi_value", "kpi_unit",
+    "target_value", "variance_vs_target", "status", "trend", "description",
+    "load_timestamp", "metadata"
+).write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_kpi_gold")
+
+kpi_count = revenue_by_bu.count()
+print(f"✓ Calculated {kpi_count} preliminary KPIs")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Verify Processing
+
+# COMMAND ----------
+
+print("\n=== Phase 1 & 2 Processing Summary ===\n")
+
+# Silver tables
+print("Silver Layer:")
+print(f"  fx_rates_std: {spark.table(f'{CATALOG}.{SILVER_SCHEMA}.fx_rates_std').count():,} records")
+print(f"  close_trial_balance_std: {spark.table(f'{CATALOG}.{SILVER_SCHEMA}.close_trial_balance_std').count():,} records")
+
+# Gold tables
+print("\nGold Layer:")
+print(f"  close_phase_tasks: {spark.table(f'{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks').count():,} tasks")
+print(f"  close_status_gold: {spark.table(f'{CATALOG}.{GOLD_SCHEMA}.close_status_gold').count():,} status records")
+print(f"  close_kpi_gold: {spark.table(f'{CATALOG}.{GOLD_SCHEMA}.close_kpi_gold').count():,} KPIs")
+
+# COMMAND ----------
+
+# Display samples
+print("\n=== Close Status by BU ===")
+display(
+    spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_status_gold")
+    .orderBy("bu")
+)
+
+print("\n=== Phase Tasks Status ===")
+display(
+    spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks")
     .groupBy("phase_name", "status")
     .count()
     .orderBy("phase_name", "status")
 )
 
-print("\nClose Status Summary:")
-display(status_summary)
-
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Processing Summary
+# MAGIC ## Summary
 
 # COMMAND ----------
 
-print("\n" + "="*80)
-print("PHASE 1 & 2 PROCESSING COMPLETE")
-print("="*80)
+print(f"""
+✓ Phase 1 & 2 Processing Complete!
 
-print(f"\n✓ FX Rates Standardized: {fx_count} rates")
-print(f"✓ Trial Balance Records: {tb_count} records")
-print(f"✓ Close Status Tasks: {len(status_records)} tasks")
+Processed for period: {CURRENT_PERIOD}
 
-print(f"\nPeriod: {CURRENT_PERIOD}")
-print(f"Phase 1 Status: All tasks completed")
-print(f"Phase 2 Status: All tasks completed")
+Silver Tables Updated:
+- fx_rates_std: FX rates standardized with anomaly detection
+- close_trial_balance_std: Trial balance with all cuts and data quality flags
 
-print("\n📊 Next Steps:")
-print("1. Run notebook 04 to process Phase 3 data (segmented + forecast)")
-print("2. Review preliminary KPIs in Gold tables")
-print("3. Start agent workflows for automated monitoring")
+Gold Tables Updated:
+- close_phase_tasks: Task tracking initialized for Phase 1 & 2
+- close_status_gold: Close status by BU and consolidated
+- close_kpi_gold: Preliminary financial KPIs
 
-# COMMAND ----------
+Next Steps:
+1. Review close status in Genie or dashboards
+2. Run notebook 04_ingest_and_standardize_phase3.py to process segmented and forecast data
+3. Run agent notebooks (05-07) for automated monitoring and analysis
 
-# MAGIC %md
-# MAGIC ## ✅ Phase 1 & 2 Processing Complete
-# MAGIC 
-# MAGIC **Processed:**
-# MAGIC - ✓ FX rates validated and standardized
-# MAGIC - ✓ Trial balance converted to reporting currency
-# MAGIC - ✓ Preliminary KPIs calculated
-# MAGIC - ✓ Close status tracking initialized
-# MAGIC 
-# MAGIC **Ready for:**
-# MAGIC - Phase 3 data ingestion (segmented + forecast)
-# MAGIC - Agent automation
-# MAGIC - Genie queries on preliminary results
+Current Phase: Phase 2 - Adjustments (in progress)
+Next Milestone: Preliminary results review meeting
+""")

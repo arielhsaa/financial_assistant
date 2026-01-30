@@ -1,509 +1,589 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Financial Close - Close Supervisor Agent
+# MAGIC # Financial Close - Agent Logic: Close Supervisor (Orchestrator)
 # MAGIC 
-# MAGIC **Purpose:** Orchestrate the entire financial close process across all phases
+# MAGIC This notebook implements the **Orchestrator Agent** (Close Supervisor) that:
+# MAGIC - Monitors `close_phase_tasks` and underlying Bronze/Silver tables
+# MAGIC - Advances task statuses from "pending" → "in_progress" → "completed" when prerequisites are met
+# MAGIC - Writes progress logs to `close_agent_logs`
+# MAGIC - Identifies blockers and notifies stakeholders (simulated)
 # MAGIC 
-# MAGIC **Responsibilities:**
-# MAGIC - Monitor `close_status_gold` for task completion
-# MAGIC - Enforce dependencies between tasks and phases
-# MAGIC - Auto-transition task statuses when conditions are met
-# MAGIC - Log all orchestration decisions for audit trail
-# MAGIC - Alert on blocked or overdue tasks
-# MAGIC 
-# MAGIC **Execution:** Can run hourly via Databricks workflow
-# MAGIC 
-# MAGIC **Agent Type:** Orchestrator
+# MAGIC **Run this notebook** continuously or on a schedule to automate close monitoring.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Setup
+# MAGIC ## Configuration
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
 from datetime import datetime, timedelta
 import json
-import uuid
 
-spark.sql("USE CATALOG financial_close_lakehouse")
+# Catalog and schema configuration
+CATALOG = "financial_close_catalog"
+BRONZE_SCHEMA = "bronze_layer"
+SILVER_SCHEMA = "silver_layer"
+GOLD_SCHEMA = "gold_layer"
 
-# Configuration
-CURRENT_PERIOD = "2025-12"
-AGENT_NAME = "close_supervisor"
-RUN_ID = str(uuid.uuid4())[:8]
+# Agent configuration
+AGENT_NAME = "Orchestrator Agent"
+CURRENT_PERIOD = 202601
 
-print(f"🤖 Close Supervisor Agent Starting")
-print(f"   Run ID: {RUN_ID}")
-print(f"   Period: {CURRENT_PERIOD}")
-print(f"   Timestamp: {datetime.now()}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 1. Load Current Close Status
-
-# COMMAND ----------
-
-# Load current status for the period
-close_status = (
-    spark.table("gold.close_status_gold")
-    .filter(F.col("period") == CURRENT_PERIOD)
-)
-
-total_tasks = close_status.count()
-completed_tasks = close_status.filter(F.col("status") == "completed").count()
-completion_pct = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
-
-print(f"\n📊 Close Status Overview:")
-print(f"   Total tasks: {total_tasks}")
-print(f"   Completed: {completed_tasks}")
-print(f"   Completion: {completion_pct:.1f}%")
-
-# Show status by phase
-status_by_phase = (
-    close_status
-    .groupBy("phase_name", "status")
-    .count()
-    .orderBy("phase_name")
-)
-
-print("\nStatus by Phase:")
-display(status_by_phase)
+print(f"{AGENT_NAME} starting...")
+print(f"Monitoring period: {CURRENT_PERIOD}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Load Phase and Task Dependencies
+# MAGIC ## Helper Functions
 
 # COMMAND ----------
 
-# Load phase definitions with dependencies
-phase_defs = spark.table("config.close_phase_definitions")
-
-# Create dependency map
-dependency_map = {}
-for row in phase_defs.collect():
-    dependency_map[row.task_id] = {
-        "task_name": row.task_name,
-        "phase_id": row.phase_id,
-        "depends_on": row.depends_on_tasks,
-        "is_bu_specific": row.is_bu_specific
-    }
-
-print(f"✓ Loaded {len(dependency_map)} task definitions")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 3. Check Dependencies and Transition Tasks
-
-# COMMAND ----------
-
-def log_agent_action(action_type, task_id, bu_code, decision, input_data, output_data, status="success"):
-    """Helper to log agent decisions"""
-    log_record = {
-        "log_id": str(uuid.uuid4()),
+def log_agent_action(period, action, target_table, target_key, status, message, execution_time_ms=0):
+    """Log agent action to close_agent_logs"""
+    log_data = [{
         "log_timestamp": datetime.now(),
+        "period": period,
         "agent_name": AGENT_NAME,
-        "action_type": action_type,
-        "period": CURRENT_PERIOD,
-        "task_id": task_id,
-        "bu_code": bu_code,
-        "decision_rationale": decision,
-        "input_data": json.dumps(input_data),
-        "output_data": json.dumps(output_data),
+        "action": action,
+        "target_table": target_table,
+        "target_record_key": target_key,
         "status": status,
-        "execution_time_ms": 0  # Would be calculated in production
-    }
+        "message": message,
+        "execution_time_ms": execution_time_ms,
+        "user_context": "system",
+        "metadata": json.dumps({"automated": True})
+    }]
     
-    return log_record
+    log_df = spark.createDataFrame(log_data)
+    log_df.write.format("delta").mode("append").saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_agent_logs")
+    
+    return log_df
+
+def check_task_prerequisites(task_id, dependencies, tasks_df):
+    """Check if task dependencies are met"""
+    if not dependencies or dependencies == "":
+        return True
+    
+    dep_list = [d.strip() for d in dependencies.split(",")]
+    
+    for dep_task_id in dep_list:
+        dep_status = tasks_df.filter(col("task_id") == dep_task_id).select("status").first()
+        if dep_status is None or dep_status[0] != "completed":
+            return False
+    
+    return True
+
+def check_data_availability(task_name, bu=None):
+    """Check if required data is available for a task"""
+    if "exchange rates" in task_name.lower():
+        # Check if FX data exists
+        fx_count = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.fx_rates_raw").count()
+        return fx_count > 0
+    
+    elif "preliminary close" in task_name.lower() and bu:
+        # Check if BU submitted preliminary close
+        bu_count = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.bu_pre_close_raw") \
+            .filter((col("period") == CURRENT_PERIOD) & (col("bu") == bu)) \
+            .count()
+        return bu_count > 0
+    
+    elif "segmented" in task_name.lower() and bu:
+        # Check if BU submitted segmented data
+        seg_count = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.bu_segmented_raw") \
+            .filter((col("period") == CURRENT_PERIOD) & (col("bu") == bu)) \
+            .count()
+        return seg_count > 0
+    
+    elif "forecast" in task_name.lower() and bu:
+        # Check if BU submitted forecast
+        forecast_count = spark.table(f"{CATALOG}.{BRONZE_SCHEMA}.bu_forecast_raw") \
+            .filter(col("bu") == bu) \
+            .count()
+        return forecast_count > 0
+    
+    return True  # Default: assume data is available
 
 # COMMAND ----------
 
-# Check each pending task to see if dependencies are met
-pending_tasks = (
-    close_status
-    .filter(F.col("status").isin(["pending", "in_progress"]))
-    .collect()
+# MAGIC %md
+# MAGIC ## 1. Load Current Tasks
+
+# COMMAND ----------
+
+print("Loading current tasks...")
+start_time = datetime.now()
+
+tasks_df = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks") \
+    .filter(col("period") == CURRENT_PERIOD)
+
+task_count = tasks_df.count()
+pending_count = tasks_df.filter(col("status") == "pending").count()
+in_progress_count = tasks_df.filter(col("status") == "in_progress").count()
+completed_count = tasks_df.filter(col("status") == "completed").count()
+blocked_count = tasks_df.filter(col("status") == "blocked").count()
+
+print(f"✓ Loaded {task_count} tasks")
+print(f"  - Pending: {pending_count}")
+print(f"  - In Progress: {in_progress_count}")
+print(f"  - Completed: {completed_count}")
+print(f"  - Blocked: {blocked_count}")
+
+execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+log_agent_action(
+    period=CURRENT_PERIOD,
+    action="load_tasks",
+    target_table=f"{GOLD_SCHEMA}.close_phase_tasks",
+    target_key=f"period={CURRENT_PERIOD}",
+    status="success",
+    message=f"Loaded {task_count} tasks for monitoring",
+    execution_time_ms=execution_time
 )
 
-actions_taken = []
-logs_to_write = []
+# COMMAND ----------
 
-print(f"\n🔍 Checking {len(pending_tasks)} pending/in-progress tasks...\n")
+# MAGIC %md
+# MAGIC ## 2. Advance Pending Tasks
+
+# COMMAND ----------
+
+print("\nChecking pending tasks for advancement...")
+
+# Get all pending tasks
+pending_tasks = tasks_df.filter(col("status") == "pending").collect()
+
+tasks_to_update = []
 
 for task in pending_tasks:
-    task_def = dependency_map.get(task.task_id, {})
-    depends_on = task_def.get("depends_on", [])
+    task_id = task["task_id"]
+    task_name = task["task_name"]
+    bu = task["bu"]
+    dependencies = task["dependencies"]
     
-    # Check if all dependencies are completed
-    if depends_on:
-        if task.bu_code:
-            # BU-specific task - check dependencies for same BU
-            dependencies_met = True
-            for dep_task_id in depends_on:
-                dep_status = (
-                    close_status
-                    .filter(F.col("task_id") == dep_task_id)
-                    .filter(F.col("bu_code") == task.bu_code)
-                    .select("status")
-                    .first()
-                )
-                
-                if not dep_status or dep_status.status != "completed":
-                    dependencies_met = False
-                    break
-        else:
-            # Group-level task - check dependencies (could be group or all BUs)
-            dependencies_met = True
-            for dep_task_id in depends_on:
-                dep_task_def = dependency_map.get(dep_task_id, {})
-                
-                if dep_task_def.get("is_bu_specific"):
-                    # Must check all BUs have completed
-                    incomplete_bus = (
-                        close_status
-                        .filter(F.col("task_id") == dep_task_id)
-                        .filter(F.col("status") != "completed")
-                        .count()
-                    )
-                    
-                    if incomplete_bus > 0:
-                        dependencies_met = False
-                        break
-                else:
-                    # Group-level dependency
-                    dep_status = (
-                        close_status
-                        .filter(F.col("task_id") == dep_task_id)
-                        .select("status")
-                        .first()
-                    )
-                    
-                    if not dep_status or dep_status.status != "completed":
-                        dependencies_met = False
-                        break
-        
-        # Transition task if dependencies met
-        if dependencies_met and task.status == "pending":
-            print(f"✓ Task {task.task_id} ({task.task_name}) - Dependencies met, transitioning to in_progress")
-            
-            actions_taken.append({
-                "period": CURRENT_PERIOD,
-                "task_id": task.task_id,
-                "bu_code": task.bu_code,
-                "old_status": "pending",
-                "new_status": "in_progress",
-                "reason": f"All {len(depends_on)} dependencies completed"
-            })
-            
-            # Log action
-            logs_to_write.append(
-                log_agent_action(
-                    action_type="status_update",
-                    task_id=task.task_id,
-                    bu_code=task.bu_code,
-                    decision=f"Transitioned to in_progress - dependencies {depends_on} are completed",
-                    input_data={"current_status": "pending", "depends_on": depends_on},
-                    output_data={"new_status": "in_progress", "dependencies_met": True}
-                )
-            )
-        elif not dependencies_met:
-            print(f"⏳ Task {task.task_id} ({task.task_name}) - Waiting on dependencies: {depends_on}")
-            
-            # Log that we checked but dependencies not met
-            logs_to_write.append(
-                log_agent_action(
-                    action_type="dependency_check",
-                    task_id=task.task_id,
-                    bu_code=task.bu_code,
-                    decision=f"Dependencies not yet met: {depends_on}",
-                    input_data={"current_status": task.status, "depends_on": depends_on},
-                    output_data={"action": "none", "dependencies_met": False}
-                )
-            )
+    # Check prerequisites
+    prereqs_met = check_task_prerequisites(task_id, dependencies, tasks_df)
+    
+    if not prereqs_met:
+        print(f"  - {task_id}: Prerequisites not met")
+        continue
+    
+    # Check data availability
+    data_available = check_data_availability(task_name, bu)
+    
+    if not data_available:
+        print(f"  - {task_id}: Data not available yet")
+        continue
+    
+    # Check if task is overdue
+    planned_due = task["planned_due_date"]
+    is_overdue = datetime.now() > planned_due if planned_due else False
+    
+    # Advance to in_progress or completed based on task type
+    # For automated tasks (with agent assigned), move directly to completed
+    # For manual tasks, move to in_progress
+    if task["agent_assigned"]:
+        new_status = "completed"
+        completion_time = datetime.now()
+        message = f"Automated task {task_id} completed by agent"
     else:
-        # No dependencies - task should be in_progress or completed already
-        if task.status == "pending":
-            print(f"✓ Task {task.task_id} ({task.task_name}) - No dependencies, can start immediately")
-
-print(f"\n📝 Actions to take: {len(actions_taken)}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 4. Check for Overdue Tasks
-
-# COMMAND ----------
-
-# Find overdue tasks (planned due date in past, not completed)
-overdue_tasks = (
-    close_status
-    .filter(F.col("status") != "completed")
-    .filter(F.col("planned_due_date") < F.current_date())
-    .withColumn("days_overdue", F.datediff(F.current_date(), F.col("planned_due_date")))
-    .orderBy(F.desc("days_overdue"))
-)
-
-overdue_count = overdue_tasks.count()
-
-if overdue_count > 0:
-    print(f"\n⚠️  {overdue_count} OVERDUE TASKS DETECTED:\n")
+        new_status = "in_progress"
+        completion_time = None
+        message = f"Task {task_id} ready to start (data available, prerequisites met)"
     
-    for task in overdue_tasks.collect():
-        print(f"   - Task {task.task_id} ({task.task_name})")
-        print(f"     BU: {task.bu_code or 'Group'}, Owner: {task.owner_role}")
-        print(f"     Days overdue: {task.days_overdue}")
-        
-        # Log alert
-        logs_to_write.append(
-            log_agent_action(
-                action_type="alert",
-                task_id=task.task_id,
-                bu_code=task.bu_code,
-                decision=f"Task is {task.days_overdue} days overdue - alerting owner {task.owner_role}",
-                input_data={"planned_due_date": str(task.planned_due_date), "current_status": task.status},
-                output_data={"alert_type": "overdue", "days_overdue": task.days_overdue},
-                status="warning"
-            )
-        )
-else:
-    print(f"\n✓ No overdue tasks")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 5. Check Phase Completion
-
-# COMMAND ----------
-
-# Determine which phases are complete
-phase_completion = (
-    close_status
-    .groupBy("phase_id", "phase_name")
-    .agg(
-        F.count("*").alias("total_tasks"),
-        F.sum(F.when(F.col("status") == "completed", 1).otherwise(0)).alias("completed_tasks")
+    tasks_to_update.append({
+        "task_id": task_id,
+        "new_status": new_status,
+        "actual_start_timestamp": datetime.now(),
+        "actual_completion_timestamp": completion_time,
+        "message": message
+    })
+    
+    print(f"  ✓ {task_id}: {task['status']} → {new_status}")
+    
+    # Log the advancement
+    log_agent_action(
+        period=CURRENT_PERIOD,
+        action="advance_task",
+        target_table=f"{GOLD_SCHEMA}.close_phase_tasks",
+        target_key=task_id,
+        status="success",
+        message=message,
+        execution_time_ms=0
     )
-    .withColumn("is_complete", F.col("total_tasks") == F.col("completed_tasks"))
-    .orderBy("phase_id")
-)
 
-print("\n📊 Phase Completion Status:\n")
-for phase in phase_completion.collect():
-    status_icon = "✅" if phase.is_complete else "🔄"
-    print(f"{status_icon} Phase {phase.phase_id} - {phase.phase_name}")
-    print(f"   Progress: {phase.completed_tasks}/{phase.total_tasks} tasks")
+print(f"\n✓ Identified {len(tasks_to_update)} tasks to update")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Update Task Statuses
+
+# COMMAND ----------
+
+if len(tasks_to_update) > 0:
+    print("Updating task statuses...")
     
-    if phase.is_complete:
-        # Log phase completion
-        logs_to_write.append(
-            log_agent_action(
-                action_type="phase_completion",
-                task_id=None,
-                bu_code=None,
-                decision=f"Phase {phase.phase_id} ({phase.phase_name}) is 100% complete",
-                input_data={"phase_id": phase.phase_id, "total_tasks": phase.total_tasks},
-                output_data={"completed_tasks": phase.completed_tasks, "phase_complete": True}
-            )
+    # Read current tasks
+    tasks_current = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks")
+    
+    # Create updates DataFrame
+    updates_df = spark.createDataFrame(tasks_to_update)
+    
+    # Join and update
+    tasks_updated = tasks_current.alias("current") \
+        .join(updates_df.alias("updates"), "task_id", "left") \
+        .select(
+            col("current.period"),
+            col("current.phase_id"),
+            col("current.phase_name"),
+            col("current.task_id"),
+            col("current.task_name"),
+            col("current.bu"),
+            col("current.owner_role"),
+            col("current.planned_due_date"),
+            coalesce(col("updates.actual_start_timestamp"), col("current.actual_start_timestamp")).alias("actual_start_timestamp"),
+            coalesce(col("updates.actual_completion_timestamp"), col("current.actual_completion_timestamp")).alias("actual_completion_timestamp"),
+            coalesce(col("updates.new_status"), col("current.status")).alias("status"),
+            col("current.blocking_reason"),
+            coalesce(col("updates.message"), col("current.comments")).alias("comments"),
+            col("current.agent_assigned"),
+            col("current.priority"),
+            col("current.dependencies"),
+            when(col("updates.task_id").isNotNull(), current_timestamp())
+                .otherwise(col("current.last_updated_timestamp")).alias("last_updated_timestamp"),
+            col("current.metadata")
         )
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 6. Update Close Status and Write Logs
-
-# COMMAND ----------
-
-# Apply status transitions
-if actions_taken:
-    print(f"\n🔧 Applying {len(actions_taken)} status updates...")
     
-    for action in actions_taken:
-        # Update status in Gold table
-        spark.sql(f"""
-            UPDATE gold.close_status_gold
-            SET status = '{action['new_status']}',
-                comments = CONCAT(COALESCE(comments, ''), '\\n[{datetime.now()}] Supervisor: {action['reason']}'),
-                last_updated_by = '{AGENT_NAME}',
-                updated_at = current_timestamp()
-            WHERE period = '{action['period']}'
-              AND task_id = {action['task_id']}
-              AND {'bu_code = "' + action['bu_code'] + '"' if action['bu_code'] else 'bu_code IS NULL'}
-        """)
+    # Write back to table
+    tasks_updated.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks")
     
-    print("✓ Status updates applied")
+    print(f"✓ Updated {len(tasks_to_update)} task statuses")
 else:
-    print("\nℹ️  No status updates needed")
-
-# COMMAND ----------
-
-# Write agent logs
-if logs_to_write:
-    logs_df = spark.createDataFrame(logs_to_write)
-    logs_df.write.mode("append").saveAsTable("gold.close_agent_logs")
-    
-    print(f"✓ Wrote {len(logs_to_write)} log entries")
+    print("No tasks to update at this time")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 7. Generate Executive Summary
+# MAGIC ## 4. Identify Blockers and Issues
 
 # COMMAND ----------
 
-# Calculate overall close metrics
-close_metrics = {
-    "period": CURRENT_PERIOD,
-    "run_timestamp": datetime.now().isoformat(),
-    "total_tasks": total_tasks,
-    "completed_tasks": completed_tasks,
-    "completion_pct": round(completion_pct, 1),
-    "overdue_tasks": overdue_count,
-    "phases_complete": phase_completion.filter(F.col("is_complete")).count(),
-    "total_phases": phase_completion.count(),
-    "actions_taken": len(actions_taken),
-    "alerts_raised": len([log for log in logs_to_write if log["status"] == "warning"])
-}
+print("\nChecking for blockers and issues...")
 
-print("\n" + "="*80)
-print("CLOSE SUPERVISOR AGENT - EXECUTION SUMMARY")
-print("="*80)
-print(f"\nPeriod: {close_metrics['period']}")
-print(f"Run: {RUN_ID} at {close_metrics['run_timestamp']}")
-print(f"\n📊 Progress:")
-print(f"   Completed: {close_metrics['completed_tasks']}/{close_metrics['total_tasks']} tasks ({close_metrics['completion_pct']}%)")
-print(f"   Phases complete: {close_metrics['phases_complete']}/{close_metrics['total_phases']}")
-print(f"\n🔧 Actions:")
-print(f"   Status transitions: {close_metrics['actions_taken']}")
-print(f"   Alerts raised: {close_metrics['alerts_raised']}")
-print(f"   Overdue tasks: {close_metrics['overdue_tasks']}")
+# Reload tasks after updates
+tasks_df = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_phase_tasks") \
+    .filter(col("period") == CURRENT_PERIOD)
 
-# Update agent configuration with last run time
-spark.sql(f"""
-    UPDATE config.agent_configuration
-    SET last_run_timestamp = current_timestamp(),
-        updated_at = current_timestamp()
-    WHERE agent_name = '{AGENT_NAME}'
-""")
-
-print(f"\n✓ Agent configuration updated")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 8. Determine Next Actions
-
-# COMMAND ----------
-
-# Provide recommendations for next steps
-recommendations = []
-
-# Check if Phase 4 is ready to start
-phase3_complete = phase_completion.filter(F.col("phase_id") == 3).first()
-phase4_started = close_status.filter((F.col("phase_id") == 4) & (F.col("status") != "pending")).count()
-
-if phase3_complete and phase3_complete.is_complete and phase4_started == 0:
-    recommendations.append("✅ Phase 3 complete - Ready to start Phase 4 review meetings")
-
-# Check if Phase 5 is ready
-phase4_complete = phase_completion.filter(F.col("phase_id") == 4).first()
-if phase4_complete and phase4_complete.is_complete:
-    recommendations.append("✅ Phase 4 complete - Ready to publish final results (Phase 5)")
-
-# Check if any phases are stuck
-stuck_phases = phase_completion.filter(
-    (F.col("is_complete") == False) & 
-    (F.col("phase_id") < 5)
+# Check for overdue tasks
+overdue_tasks = tasks_df.filter(
+    (col("status").isin(["pending", "in_progress"])) &
+    (col("planned_due_date") < current_timestamp())
 ).collect()
 
-for phase in stuck_phases:
-    if phase.completed_tasks / phase.total_tasks < 0.5:
-        recommendations.append(f"⚠️  Phase {phase.phase_id} ({phase.phase_name}) is <50% complete - may need attention")
-
-# Overdue tasks
-if overdue_count > 0:
-    recommendations.append(f"🔴 {overdue_count} overdue tasks require immediate attention")
-
-print("\n💡 Recommendations:\n")
-if recommendations:
-    for rec in recommendations:
-        print(f"   {rec}")
-else:
-    print("   All tasks progressing as planned")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 9. Trigger Downstream Agents (if needed)
-
-# COMMAND ----------
-
-# Determine which domain agents should run based on current state
-agents_to_trigger = []
-
-# If Phase 1 or 2 has new data, trigger FX and Pre-Close agents
-phase1_incomplete = close_status.filter((F.col("phase_id") <= 2) & (F.col("status") != "completed")).count()
-if phase1_incomplete == 0:
-    agents_to_trigger.append("fx_agent")
-    agents_to_trigger.append("pre_close_agent")
-
-# If Phase 3 has new data, trigger Segmented & Forecast agent
-phase3_incomplete = close_status.filter((F.col("phase_id") == 3) & (F.col("status") != "completed")).count()
-if phase3_incomplete == 0:
-    agents_to_trigger.append("segmented_forecast_agent")
-
-# If all phases complete, trigger Reporting agent
-all_complete = close_status.filter(F.col("status") != "completed").count()
-if all_complete == 0:
-    agents_to_trigger.append("reporting_agent")
-
-if agents_to_trigger:
-    print(f"\n🤖 Downstream agents to trigger:")
-    for agent in agents_to_trigger:
-        print(f"   - {agent}")
-    
-    # Log trigger decisions
-    for agent in agents_to_trigger:
-        logs_to_write.append(
-            log_agent_action(
-                action_type="trigger_agent",
-                task_id=None,
-                bu_code=None,
-                decision=f"Triggering {agent} based on phase completion status",
-                input_data={"triggered_by": AGENT_NAME, "run_id": RUN_ID},
-                output_data={"agent_triggered": agent, "trigger_time": datetime.now().isoformat()}
-            )
+if len(overdue_tasks) > 0:
+    print(f"\n⚠ Found {len(overdue_tasks)} overdue tasks:")
+    for task in overdue_tasks:
+        hours_overdue = (datetime.now() - task["planned_due_date"]).total_seconds() / 3600
+        print(f"  - {task['task_id']}: {task['task_name']} (overdue by {hours_overdue:.1f} hours)")
+        
+        # Log the issue
+        log_agent_action(
+            period=CURRENT_PERIOD,
+            action="detect_overdue",
+            target_table=f"{GOLD_SCHEMA}.close_phase_tasks",
+            target_key=task["task_id"],
+            status="warning",
+            message=f"Task {task['task_id']} is overdue by {hours_overdue:.1f} hours",
+            execution_time_ms=0
         )
-    
-    # Write trigger logs
-    if logs_to_write:
-        logs_df = spark.createDataFrame(logs_to_write)
-        logs_df.write.mode("append").saveAsTable("gold.close_agent_logs")
 else:
-    print("\nℹ️  No downstream agents need to be triggered at this time")
+    print("  ✓ No overdue tasks")
+
+# Check for explicitly blocked tasks
+blocked_tasks = tasks_df.filter(col("status") == "blocked").collect()
+
+if len(blocked_tasks) > 0:
+    print(f"\n⚠ Found {len(blocked_tasks)} blocked tasks:")
+    for task in blocked_tasks:
+        print(f"  - {task['task_id']}: {task['task_name']} - Reason: {task['blocking_reason']}")
+        
+        # Log the issue
+        log_agent_action(
+            period=CURRENT_PERIOD,
+            action="detect_blocked",
+            target_table=f"{GOLD_SCHEMA}.close_phase_tasks",
+            target_key=task["task_id"],
+            status="error",
+            message=f"Task {task['task_id']} is blocked: {task['blocking_reason']}",
+            execution_time_ms=0
+        )
+else:
+    print("  ✓ No blocked tasks")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## ✅ Close Supervisor Agent Complete
-# MAGIC 
-# MAGIC **Summary:**
-# MAGIC - Monitored close progress across all phases
-# MAGIC - Checked task dependencies and transitioned statuses
-# MAGIC - Identified overdue tasks and raised alerts
-# MAGIC - Logged all decisions for audit trail
-# MAGIC - Provided recommendations for next steps
-# MAGIC 
-# MAGIC **Scheduling:**
-# MAGIC - Run this notebook hourly during close period via Databricks Workflow
-# MAGIC - Agent will automatically orchestrate task progression
-# MAGIC - Alerts sent to FP&A team for blocked/overdue tasks
-# MAGIC 
-# MAGIC **Next Steps:**
-# MAGIC 1. Schedule as recurring Databricks Job (hourly)
-# MAGIC 2. Configure email alerts for overdue tasks
-# MAGIC 3. Run domain agents (notebooks 06-07) based on triggers
+# MAGIC ## 5. Update Overall Close Status
+
+# COMMAND ----------
+
+print("\nUpdating overall close status...")
+start_time = datetime.now()
+
+# Recalculate status metrics
+status_metrics = tasks_df.groupBy("period").agg(
+    max("phase_id").alias("current_phase"),
+    count("*").alias("total_tasks"),
+    sum(when(col("status") == "completed", 1).otherwise(0)).alias("completed_tasks"),
+    sum(when(col("status") == "blocked", 1).otherwise(0)).alias("blocked_tasks"),
+    sum(when(col("status") == "in_progress", 1).otherwise(0)).alias("in_progress_tasks")
+).first()
+
+completion_pct = (status_metrics["completed_tasks"] / status_metrics["total_tasks"]) * 100
+
+# Determine overall status
+if status_metrics["blocked_tasks"] > 0:
+    overall_status = "issues"
+elif completion_pct == 100:
+    overall_status = "completed"
+elif status_metrics["in_progress_tasks"] > 0:
+    overall_status = "in_progress"
+else:
+    overall_status = "not_started"
+
+# Get phase name
+phase_names = {1: "Data Gathering", 2: "Adjustments", 3: "Data Gathering", 4: "Review", 5: "Reporting & Sign-off"}
+current_phase_name = phase_names.get(status_metrics["current_phase"], "Unknown")
+
+# Determine SLA status
+days_since_period_end = (datetime.now() - datetime(2026, 1, 31)).days
+sla_target_days = 10
+days_to_sla = sla_target_days - days_since_period_end
+
+if days_to_sla < 0:
+    sla_status = "overdue"
+elif days_to_sla < 2:
+    sla_status = "at_risk"
+else:
+    sla_status = "on_track"
+
+# Create status record
+status_data = [{
+    "period": CURRENT_PERIOD,
+    "bu": "CONSOLIDATED",
+    "phase_id": status_metrics["current_phase"],
+    "phase_name": current_phase_name,
+    "overall_status": overall_status,
+    "pct_tasks_completed": round(completion_pct, 2),
+    "total_tasks": status_metrics["total_tasks"],
+    "completed_tasks": status_metrics["completed_tasks"],
+    "blocked_tasks": status_metrics["blocked_tasks"],
+    "days_since_period_end": days_since_period_end,
+    "days_to_sla": days_to_sla,
+    "sla_status": sla_status,
+    "key_issues": f"{status_metrics['blocked_tasks']} blocked tasks" if status_metrics["blocked_tasks"] > 0 else None,
+    "last_milestone": "Phase 3 data gathering completed" if status_metrics["current_phase"] >= 3 else "Trial balance standardization",
+    "next_milestone": "Phase 4 review meetings" if status_metrics["current_phase"] == 3 else "Final reporting",
+    "agent_summary": f"Overall close progress: {completion_pct:.1f}% complete. Currently in Phase {status_metrics['current_phase']} - {current_phase_name}. SLA status: {sla_status}.",
+    "load_timestamp": datetime.now(),
+    "metadata": json.dumps({"updated_by": AGENT_NAME, "automated": True})
+}]
+
+status_df = spark.createDataFrame(status_data)
+
+# Read existing status and update or append
+existing_status = spark.table(f"{CATALOG}.{GOLD_SCHEMA}.close_status_gold") \
+    .filter((col("period") != CURRENT_PERIOD) | (col("bu") != "CONSOLIDATED"))
+
+updated_status = existing_status.union(status_df)
+
+updated_status.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .saveAsTable(f"{CATALOG}.{GOLD_SCHEMA}.close_status_gold")
+
+execution_time = int((datetime.now() - start_time).total_seconds() * 1000)
+
+print(f"✓ Updated overall close status")
+print(f"  - Phase: {current_phase_name}")
+print(f"  - Progress: {completion_pct:.1f}%")
+print(f"  - SLA Status: {sla_status}")
+
+log_agent_action(
+    period=CURRENT_PERIOD,
+    action="update_status",
+    target_table=f"{GOLD_SCHEMA}.close_status_gold",
+    target_key=f"period={CURRENT_PERIOD},bu=CONSOLIDATED",
+    status="success",
+    message=f"Updated overall status: {completion_pct:.1f}% complete, SLA {sla_status}",
+    execution_time_ms=execution_time
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Generate Notifications (Simulated)
+
+# COMMAND ----------
+
+print("\nGenerating notifications...")
+
+notifications = []
+
+# Notify about overdue tasks
+if len(overdue_tasks) > 0:
+    for task in overdue_tasks:
+        notifications.append({
+            "type": "overdue_task",
+            "recipient": task["owner_role"],
+            "subject": f"Task Overdue: {task['task_name']}",
+            "message": f"Task {task['task_id']} is overdue. Please complete or update status.",
+            "priority": task["priority"]
+        })
+
+# Notify about blocked tasks
+if len(blocked_tasks) > 0:
+    for task in blocked_tasks:
+        notifications.append({
+            "type": "blocked_task",
+            "recipient": "FP&A Lead",
+            "subject": f"Task Blocked: {task['task_name']}",
+            "message": f"Task {task['task_id']} is blocked: {task['blocking_reason']}. Intervention required.",
+            "priority": "high"
+        })
+
+# Notify about SLA risk
+if sla_status == "at_risk":
+    notifications.append({
+        "type": "sla_at_risk",
+        "recipient": "FP&A Lead",
+        "subject": "Close SLA At Risk",
+        "message": f"Period {CURRENT_PERIOD} close is at risk of missing SLA. {days_to_sla} days remaining.",
+        "priority": "high"
+    })
+elif sla_status == "overdue":
+    notifications.append({
+        "type": "sla_overdue",
+        "recipient": "FP&A Lead",
+        "subject": "Close SLA Overdue",
+        "message": f"Period {CURRENT_PERIOD} close has exceeded SLA by {abs(days_to_sla)} days.",
+        "priority": "critical"
+    })
+
+# Notify about phase completion
+if completion_pct == 100:
+    notifications.append({
+        "type": "phase_complete",
+        "recipient": "All Stakeholders",
+        "subject": f"Close Phase {status_metrics['current_phase']} Complete",
+        "message": f"Phase {status_metrics['current_phase']} - {current_phase_name} is complete. Ready to proceed to next phase.",
+        "priority": "medium"
+    })
+
+# In a real implementation, these would be sent via email/Slack
+# For now, just log them
+for notif in notifications:
+    print(f"  📧 [{notif['priority'].upper()}] To {notif['recipient']}: {notif['subject']}")
+    
+    log_agent_action(
+        period=CURRENT_PERIOD,
+        action="send_notification",
+        target_table="notifications",
+        target_key=notif["type"],
+        status="success",
+        message=f"Notification sent to {notif['recipient']}: {notif['subject']}",
+        execution_time_ms=0
+    )
+
+if len(notifications) == 0:
+    print("  ✓ No notifications needed")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7. Summary Report
+
+# COMMAND ----------
+
+print("\n" + "="*60)
+print(f"{AGENT_NAME} - Execution Summary")
+print("="*60)
+
+print(f"\nPeriod: {CURRENT_PERIOD}")
+print(f"Execution Time: {datetime.now()}")
+
+print(f"\nTask Status:")
+print(f"  Total Tasks: {status_metrics['total_tasks']}")
+print(f"  Completed: {status_metrics['completed_tasks']} ({completion_pct:.1f}%)")
+print(f"  In Progress: {status_metrics['in_progress_tasks']}")
+print(f"  Blocked: {status_metrics['blocked_tasks']}")
+print(f"  Overdue: {len(overdue_tasks)}")
+
+print(f"\nClose Progress:")
+print(f"  Current Phase: {status_metrics['current_phase']} - {current_phase_name}")
+print(f"  Overall Status: {overall_status}")
+print(f"  Days Since Period End: {days_since_period_end}")
+print(f"  Days to SLA: {days_to_sla}")
+print(f"  SLA Status: {sla_status}")
+
+print(f"\nActions Taken:")
+print(f"  Tasks Advanced: {len(tasks_to_update)}")
+print(f"  Issues Detected: {len(overdue_tasks) + len(blocked_tasks)}")
+print(f"  Notifications Sent: {len(notifications)}")
+
+print(f"\nNext Steps:")
+if status_metrics['blocked_tasks'] > 0:
+    print(f"  - Resolve {status_metrics['blocked_tasks']} blocked tasks")
+if len(overdue_tasks) > 0:
+    print(f"  - Follow up on {len(overdue_tasks)} overdue tasks")
+if completion_pct < 100:
+    print(f"  - Continue monitoring task progress")
+    print(f"  - {status_metrics['total_tasks'] - status_metrics['completed_tasks']} tasks remaining")
+else:
+    print(f"  - All tasks complete! Ready for final sign-off")
+
+print("\n" + "="*60)
+
+# Log summary
+log_agent_action(
+    period=CURRENT_PERIOD,
+    action="execution_summary",
+    target_table="summary",
+    target_key=f"execution_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    status="success",
+    message=f"Orchestrator execution complete. Progress: {completion_pct:.1f}%, SLA: {sla_status}, Issues: {len(overdue_tasks) + len(blocked_tasks)}",
+    execution_time_ms=0
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Summary
+
+# COMMAND ----------
+
+print(f"""
+✓ {AGENT_NAME} Execution Complete!
+
+The Orchestrator Agent has:
+- Monitored all tasks for period {CURRENT_PERIOD}
+- Advanced {len(tasks_to_update)} tasks based on prerequisites and data availability
+- Detected {len(overdue_tasks)} overdue tasks and {len(blocked_tasks)} blocked tasks
+- Updated overall close status to {overall_status}
+- Generated {len(notifications)} notifications for stakeholders
+
+Current close status: {completion_pct:.1f}% complete, SLA status: {sla_status}
+
+This notebook can be:
+- Scheduled to run every hour via Databricks Workflows
+- Triggered on-demand when investigating close progress
+- Integrated with monitoring dashboards for real-time status
+
+All actions logged to: {CATALOG}.{GOLD_SCHEMA}.close_agent_logs
+""")

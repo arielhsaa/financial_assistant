@@ -1,1044 +1,835 @@
 # Databricks notebook source
-# MAGIC %md
-# MAGIC # Financial Close - Dashboards and Genie Configuration
-# MAGIC 
-# MAGIC **Purpose:** Create SQL views for dashboards and provide Genie space configuration
-# MAGIC 
-# MAGIC **Creates:**
-# MAGIC - SQL views optimized for dashboard queries
-# MAGIC - Sample queries for Genie space
-# MAGIC - Dashboard layout suggestions
-# MAGIC - Genie instructions and metadata
-# MAGIC 
-# MAGIC **Note:** This notebook generates the SQL artifacts. Actual dashboard creation and Genie space
-# MAGIC setup should be done via Databricks SQL/AI-BI UI and Genie UI respectively.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Setup
-
-# COMMAND ----------
-
-spark.sql("USE CATALOG financial_close_lakehouse")
-
-print("✓ Creating views and configuration for dashboards and Genie")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Part 1: Create SQL Views for Dashboards
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### View 1: Close Cockpit - Overall Progress
-
-# COMMAND ----------
-
 # MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_close_cockpit_progress AS
-# MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   COUNT(*) as total_tasks,
-# MAGIC   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
-# MAGIC   SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_tasks,
-# MAGIC   SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_tasks,
-# MAGIC   SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) as blocked_tasks,
-# MAGIC   ROUND(100.0 * SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) / COUNT(*), 1) as completion_pct,
-# MAGIC   MAX(updated_at) as last_update
-# MAGIC FROM gold.close_status_gold
-# MAGIC GROUP BY period
-# MAGIC ORDER BY period DESC
-
-# COMMAND ----------
-
-print("✓ Created view: vw_close_cockpit_progress")
+# MAGIC -- Financial Close - Dashboards and Genie Instructions
+# MAGIC -- 
+# MAGIC -- This notebook contains:
+# MAGIC -- 1. Helper views for dashboards
+# MAGIC -- 2. Sample dashboard queries
+# MAGIC -- 3. Genie space instructions and example prompts
+# MAGIC -- 
+# MAGIC -- Use these queries to create Databricks SQL dashboards and configure Genie spaces.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### View 2: Close Cockpit - Status by Phase
+# MAGIC # Configuration
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_close_status_by_phase AS
+-- Set catalog and schema
+USE CATALOG financial_close_catalog;
+USE SCHEMA gold_layer;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Helper Views for Dashboards
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View 1: Current Close Status Summary
+
+# COMMAND ----------
+
+CREATE OR REPLACE VIEW v_current_close_status AS
+SELECT 
+  period,
+  bu,
+  phase_id,
+  phase_name,
+  overall_status,
+  pct_tasks_completed,
+  total_tasks,
+  completed_tasks,
+  blocked_tasks,
+  days_since_period_end,
+  days_to_sla,
+  sla_status,
+  key_issues,
+  last_milestone,
+  next_milestone,
+  agent_summary,
+  load_timestamp
+FROM financial_close_catalog.gold_layer.close_status_gold
+WHERE period = (SELECT MAX(period) FROM financial_close_catalog.gold_layer.close_status_gold)
+ORDER BY 
+  CASE WHEN bu = 'CONSOLIDATED' THEN 1 ELSE 2 END,
+  bu;
+
+SELECT 'View v_current_close_status created' AS status;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View 2: Task Details with Ownership
+
+# COMMAND ----------
+
+CREATE OR REPLACE VIEW v_task_details AS
+SELECT 
+  period,
+  phase_id,
+  phase_name,
+  task_id,
+  task_name,
+  bu,
+  owner_role,
+  planned_due_date,
+  actual_start_timestamp,
+  actual_completion_timestamp,
+  status,
+  priority,
+  blocking_reason,
+  comments,
+  agent_assigned,
+  CASE 
+    WHEN status = 'completed' THEN 0
+    WHEN planned_due_date < CURRENT_TIMESTAMP() THEN 
+      CAST((UNIX_TIMESTAMP(CURRENT_TIMESTAMP()) - UNIX_TIMESTAMP(planned_due_date)) / 3600 AS INT)
+    ELSE 0
+  END AS hours_overdue,
+  last_updated_timestamp
+FROM financial_close_catalog.gold_layer.close_phase_tasks
+ORDER BY period DESC, phase_id, task_id;
+
+SELECT 'View v_task_details created' AS status;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View 3: Financial Results with Prior Period Comparison
+
+# COMMAND ----------
+
+CREATE OR REPLACE VIEW v_financial_results_comparison AS
+WITH current_period AS (
+  SELECT 
+    period,
+    bu,
+    segment,
+    revenue_reporting,
+    operating_profit_reporting,
+    operating_margin_pct,
+    fx_impact_reporting
+  FROM financial_close_catalog.gold_layer.close_results_gold
+  WHERE period = (SELECT MAX(period) FROM financial_close_catalog.gold_layer.close_results_gold)
+    AND segment = 'ALL'
+    AND product = 'ALL'
+    AND region = 'ALL'
+),
+prior_period AS (
+  SELECT 
+    period,
+    bu,
+    revenue_reporting AS prior_revenue,
+    operating_profit_reporting AS prior_operating_profit,
+    operating_margin_pct AS prior_margin
+  FROM financial_close_catalog.gold_layer.close_results_gold
+  WHERE period = (SELECT MAX(period) - 1 FROM financial_close_catalog.gold_layer.close_results_gold)
+    AND segment = 'ALL'
+    AND product = 'ALL'
+    AND region = 'ALL'
+)
+SELECT 
+  c.period,
+  c.bu,
+  c.segment,
+  c.revenue_reporting AS current_revenue,
+  p.prior_revenue,
+  c.revenue_reporting - p.prior_revenue AS revenue_variance,
+  ROUND(((c.revenue_reporting - p.prior_revenue) / p.prior_revenue) * 100, 2) AS revenue_variance_pct,
+  c.operating_profit_reporting AS current_op_profit,
+  p.prior_operating_profit AS prior_op_profit,
+  c.operating_profit_reporting - p.prior_operating_profit AS op_profit_variance,
+  ROUND(((c.operating_profit_reporting - p.prior_operating_profit) / p.prior_operating_profit) * 100, 2) AS op_profit_variance_pct,
+  c.operating_margin_pct AS current_margin,
+  p.prior_margin,
+  c.operating_margin_pct - p.prior_margin AS margin_variance_ppt,
+  c.fx_impact_reporting
+FROM current_period c
+LEFT JOIN prior_period p ON c.bu = p.bu
+ORDER BY 
+  CASE WHEN c.bu = 'CONSOLIDATED' THEN 1 ELSE 2 END,
+  c.bu;
+
+SELECT 'View v_financial_results_comparison created' AS status;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View 4: Forecast Accuracy Analysis
+
+# COMMAND ----------
+
+CREATE OR REPLACE VIEW v_forecast_accuracy AS
+SELECT 
+  forecast_period,
+  bu,
+  segment,
+  scenario,
+  revenue_forecast_reporting,
+  revenue_actual_reporting,
+  variance_revenue,
+  variance_revenue_pct,
+  operating_profit_forecast_reporting,
+  operating_profit_actual_reporting,
+  variance_operating_profit,
+  variance_operating_profit_pct,
+  forecast_accuracy_score,
+  assumptions,
+  variance_drivers
+FROM financial_close_catalog.gold_layer.forecast_results_gold
+WHERE scenario = 'Base'
+  AND revenue_actual_reporting IS NOT NULL
+ORDER BY 
+  forecast_period DESC,
+  CASE WHEN bu = 'CONSOLIDATED' THEN 1 ELSE 2 END,
+  bu,
+  segment;
+
+SELECT 'View v_forecast_accuracy created' AS status;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View 5: KPI Scorecard
+
+# COMMAND ----------
+
+CREATE OR REPLACE VIEW v_kpi_scorecard AS
+SELECT 
+  period,
+  kpi_name,
+  kpi_category,
+  bu,
+  kpi_value,
+  kpi_unit,
+  target_value,
+  variance_vs_target,
+  status,
+  trend,
+  description,
+  CASE kpi_unit
+    WHEN 'currency' THEN CONCAT('$', FORMAT_NUMBER(kpi_value, 2))
+    WHEN 'percentage' THEN CONCAT(FORMAT_NUMBER(kpi_value, 2), '%')
+    WHEN 'days' THEN CONCAT(FORMAT_NUMBER(kpi_value, 0), ' days')
+    ELSE FORMAT_NUMBER(kpi_value, 0)
+  END AS formatted_value,
+  CASE kpi_unit
+    WHEN 'currency' THEN CONCAT('$', FORMAT_NUMBER(target_value, 2))
+    WHEN 'percentage' THEN CONCAT(FORMAT_NUMBER(target_value, 2), '%')
+    WHEN 'days' THEN CONCAT(FORMAT_NUMBER(target_value, 0), ' days')
+    ELSE FORMAT_NUMBER(target_value, 0)
+  END AS formatted_target
+FROM financial_close_catalog.gold_layer.close_kpi_gold
+WHERE period = (SELECT MAX(period) FROM financial_close_catalog.gold_layer.close_kpi_gold)
+ORDER BY 
+  CASE kpi_category
+    WHEN 'Timeliness' THEN 1
+    WHEN 'Financial' THEN 2
+    WHEN 'Quality' THEN 3
+    WHEN 'Efficiency' THEN 4
+    ELSE 5
+  END,
+  kpi_name;
+
+SELECT 'View v_kpi_scorecard created' AS status;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## View 6: Agent Activity Log
+
+# COMMAND ----------
+
+CREATE OR REPLACE VIEW v_agent_activity AS
+SELECT 
+  log_timestamp,
+  period,
+  agent_name,
+  action,
+  target_table,
+  target_record_key,
+  status,
+  message,
+  execution_time_ms,
+  DATE(log_timestamp) AS log_date
+FROM financial_close_catalog.gold_layer.close_agent_logs
+ORDER BY log_timestamp DESC;
+
+SELECT 'View v_agent_activity created' AS status;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Sample Dashboard Queries
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Dashboard 1: Close Cockpit
+
+# COMMAND ----------
+
+-- Query 1.1: Overall Close Progress
+SELECT 
+  bu,
+  phase_name,
+  pct_tasks_completed,
+  total_tasks,
+  completed_tasks,
+  blocked_tasks,
+  days_since_period_end,
+  days_to_sla,
+  sla_status
+FROM v_current_close_status
+ORDER BY 
+  CASE WHEN bu = 'CONSOLIDATED' THEN 1 ELSE 2 END,
+  bu;
+
+# COMMAND ----------
+
+-- Query 1.2: Tasks by Status and Phase
+SELECT 
+  phase_name,
+  status,
+  COUNT(*) AS task_count,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (PARTITION BY phase_name), 1) AS pct_of_phase
+FROM v_task_details
+WHERE period = (SELECT MAX(period) FROM v_task_details)
+GROUP BY phase_name, status
+ORDER BY 
+  CASE phase_name
+    WHEN 'Data Gathering' THEN 1
+    WHEN 'Adjustments' THEN 2
+    WHEN 'Review' THEN 3
+    WHEN 'Reporting & Sign-off' THEN 4
+    ELSE 5
+  END,
+  CASE status
+    WHEN 'completed' THEN 1
+    WHEN 'in_progress' THEN 2
+    WHEN 'pending' THEN 3
+    WHEN 'blocked' THEN 4
+    ELSE 5
+  END;
+
+# COMMAND ----------
+
+-- Query 1.3: Overdue Tasks
+SELECT 
+  task_id,
+  task_name,
+  bu,
+  owner_role,
+  planned_due_date,
+  hours_overdue,
+  priority,
+  status
+FROM v_task_details
+WHERE status IN ('pending', 'in_progress')
+  AND hours_overdue > 0
+  AND period = (SELECT MAX(period) FROM v_task_details)
+ORDER BY hours_overdue DESC, priority DESC;
+
+# COMMAND ----------
+
+-- Query 1.4: Close Timeline (Gantt-style data)
+SELECT 
+  phase_id,
+  phase_name,
+  MIN(planned_due_date) AS phase_start,
+  MAX(planned_due_date) AS phase_end,
+  COUNT(*) AS total_tasks,
+  SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed_tasks,
+  ROUND(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) AS pct_complete
+FROM v_task_details
+WHERE period = (SELECT MAX(period) FROM v_task_details)
+GROUP BY phase_id, phase_name
+ORDER BY phase_id;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Dashboard 2: Close Results
+
+# COMMAND ----------
+
+-- Query 2.1: P&L by BU
+SELECT 
+  bu,
+  current_revenue,
+  current_op_profit,
+  current_margin,
+  prior_revenue,
+  prior_op_profit,
+  revenue_variance,
+  revenue_variance_pct,
+  op_profit_variance,
+  op_profit_variance_pct
+FROM v_financial_results_comparison
+WHERE bu != 'CONSOLIDATED'
+ORDER BY current_revenue DESC;
+
+# COMMAND ----------
+
+-- Query 2.2: Consolidated P&L with Variance Waterfall
+SELECT 
+  bu,
+  current_revenue,
+  prior_revenue,
+  revenue_variance,
+  revenue_variance_pct,
+  current_op_profit,
+  prior_op_profit,
+  op_profit_variance,
+  op_profit_variance_pct,
+  fx_impact_reporting
+FROM v_financial_results_comparison
+WHERE bu = 'CONSOLIDATED';
+
+# COMMAND ----------
+
+-- Query 2.3: Segmented Results (Top Segments by Revenue)
+SELECT 
+  period,
+  bu,
+  segment,
+  product,
+  revenue_reporting,
+  operating_profit_reporting,
+  operating_margin_pct,
+  variance_vs_forecast,
+  variance_vs_forecast_pct
+FROM financial_close_catalog.gold_layer.close_results_gold
+WHERE period = (SELECT MAX(period) FROM financial_close_catalog.gold_layer.close_results_gold)
+  AND product != 'ALL'
+  AND bu != 'CONSOLIDATED'
+ORDER BY revenue_reporting DESC
+LIMIT 20;
+
+# COMMAND ----------
+
+-- Query 2.4: FX Impact Analysis
+SELECT 
+  bu,
+  local_currency,
+  SUM(revenue_local) AS revenue_local,
+  SUM(revenue_reporting) AS revenue_reporting,
+  SUM(fx_impact_reporting) AS total_fx_impact
+FROM financial_close_catalog.gold_layer.close_results_gold
+WHERE period = (SELECT MAX(period) FROM financial_close_catalog.gold_layer.close_results_gold)
+  AND segment = 'ALL'
+  AND product = 'ALL'
+  AND region = 'ALL'
+  AND bu != 'CONSOLIDATED'
+GROUP BY bu, local_currency
+ORDER BY ABS(SUM(fx_impact_reporting)) DESC;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Dashboard 3: Forecast Dashboard
+
+# COMMAND ----------
+
+-- Query 3.1: Forecast vs. Actual by BU
+SELECT 
+  bu,
+  segment,
+  revenue_forecast_reporting,
+  revenue_actual_reporting,
+  variance_revenue,
+  variance_revenue_pct,
+  operating_profit_forecast_reporting,
+  operating_profit_actual_reporting,
+  variance_operating_profit,
+  variance_operating_profit_pct,
+  forecast_accuracy_score
+FROM v_forecast_accuracy
+WHERE segment = 'ALL'
+ORDER BY 
+  CASE WHEN bu = 'CONSOLIDATED' THEN 1 ELSE 2 END,
+  bu;
+
+# COMMAND ----------
+
+-- Query 3.2: Top Forecast Variances
+SELECT 
+  bu,
+  segment,
+  revenue_forecast_reporting,
+  revenue_actual_reporting,
+  variance_revenue,
+  variance_revenue_pct,
+  operating_profit_forecast_reporting,
+  operating_profit_actual_reporting,
+  variance_operating_profit,
+  variance_operating_profit_pct,
+  variance_drivers
+FROM v_forecast_accuracy
+WHERE segment != 'ALL'
+  AND ABS(variance_operating_profit_pct) > 10
+ORDER BY ABS(variance_operating_profit) DESC;
+
+# COMMAND ----------
+
+-- Query 3.3: Scenario Comparison
+SELECT 
+  forecast_period,
+  bu,
+  scenario,
+  SUM(revenue_forecast_reporting) AS total_revenue,
+  SUM(operating_profit_forecast_reporting) AS total_op_profit,
+  ROUND(SUM(operating_profit_forecast_reporting) / SUM(revenue_forecast_reporting) * 100, 2) AS op_margin
+FROM financial_close_catalog.gold_layer.forecast_results_gold
+WHERE forecast_period >= (SELECT MAX(period) FROM financial_close_catalog.gold_layer.close_results_gold)
+  AND bu != 'CONSOLIDATED'
+GROUP BY forecast_period, bu, scenario
+ORDER BY forecast_period, bu, scenario;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Dashboard 4: KPI Scorecard
+
+# COMMAND ----------
+
+-- Query 4.1: All KPIs for Current Period
+SELECT 
+  kpi_category,
+  kpi_name,
+  formatted_value AS current_value,
+  formatted_target AS target,
+  status,
+  trend,
+  description
+FROM v_kpi_scorecard
+ORDER BY 
+  CASE kpi_category
+    WHEN 'Timeliness' THEN 1
+    WHEN 'Financial' THEN 2
+    WHEN 'Quality' THEN 3
+    ELSE 4
+  END,
+  kpi_name;
+
+# COMMAND ----------
+
+-- Query 4.2: KPI Trends (Last 6 Periods)
+SELECT 
+  period,
+  kpi_name,
+  kpi_value,
+  target_value,
+  status
+FROM financial_close_catalog.gold_layer.close_kpi_gold
+WHERE period >= (SELECT MAX(period) - 5 FROM financial_close_catalog.gold_layer.close_kpi_gold)
+  AND bu = 'CONSOLIDATED'
+  AND kpi_name IN ('Close Cycle Time', 'Operating Margin', 'Forecast Accuracy')
+ORDER BY kpi_name, period;
+
+# COMMAND ----------
+
+-- Query 4.3: KPI Status Summary
+SELECT 
+  status,
+  COUNT(*) AS kpi_count,
+  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) AS pct_of_total
+FROM v_kpi_scorecard
+GROUP BY status
+ORDER BY 
+  CASE status
+    WHEN 'on_target' THEN 1
+    WHEN 'warning' THEN 2
+    WHEN 'critical' THEN 3
+    ELSE 4
+  END;
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Genie Space Configuration
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Genie Space Instructions
+# MAGIC 
+# MAGIC When setting up the Genie space for "Financial Close Assistant", include these instructions:
+# MAGIC 
+# MAGIC ```
+# MAGIC You are a financial close assistant for FP&A and controlling teams.
+# MAGIC 
+# MAGIC Context:
+# MAGIC - Fiscal periods follow calendar months (January = Period 1 / 202601, December = Period 12 / 202612)
+# MAGIC - All amounts are in reporting currency (USD) unless specified as local_currency
+# MAGIC - Business units include: North America, Europe, Asia Pacific, Latin America, Middle East
+# MAGIC - Segments include: Product A, Product B, Services, Other
+# MAGIC - Close phases: 1=Data Gathering, 2=Adjustments, 3=Data Gathering, 4=Review, 5=Reporting & Sign-off
+# MAGIC 
+# MAGIC KPI Naming Conventions:
+# MAGIC - "Revenue" = Total revenue from all sources
+# MAGIC - "Operating Profit" = Revenue - COGS - Operating Expenses
+# MAGIC - "Operating Margin" = Operating Profit / Revenue (as percentage)
+# MAGIC - "FX Impact" = Difference between local currency and reporting currency amounts
+# MAGIC - "Variance" = Actual - Forecast (positive variance = favorable for revenue/profit)
+# MAGIC - "Cycle Time" = Days from period end to close completion
+# MAGIC 
+# MAGIC Response Style:
+# MAGIC - Start with executive summary (2-3 sentences highlighting key findings)
+# MAGIC - Then provide detailed breakdown with numbers formatted as currency ($X,XXX) or percentages (X.X%)
+# MAGIC - Highlight anomalies or items requiring attention
+# MAGIC - Use tables for multi-dimensional data
+# MAGIC - When showing trends, include at least 3 data points for context
+# MAGIC 
+# MAGIC Available Data:
+# MAGIC - close_status_gold: Overall close status by period and BU
+# MAGIC - close_results_gold: Final P&L results (segmented and consolidated)
+# MAGIC - forecast_results_gold: Forecast data with variance analysis vs. actuals
+# MAGIC - close_kpi_gold: Key performance indicators for close process
+# MAGIC - close_phase_tasks: Detailed task tracking across all phases
+# MAGIC - close_agent_logs: Audit log of all agent actions
+# MAGIC 
+# MAGIC Common Questions:
+# MAGIC - For status questions, always check close_status_gold first
+# MAGIC - For financial questions, use close_results_gold (consolidated or by BU/segment)
+# MAGIC - For variance analysis, join close_results_gold with forecast_results_gold
+# MAGIC - For process questions, use close_phase_tasks and close_kpi_gold
+# MAGIC - For troubleshooting, check close_agent_logs for recent agent activity
+# MAGIC ```
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Example Genie Queries
+# MAGIC 
+# MAGIC Save these queries in the Genie space for quick access:
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Query 1: Current Close Status
+# MAGIC 
+# MAGIC **User prompt:** "Show me the status of the current month close by BU and phase"
+# MAGIC 
+# MAGIC **Expected SQL:**
+# MAGIC ```sql
 # MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   phase_id,
+# MAGIC   bu,
 # MAGIC   phase_name,
-# MAGIC   COUNT(*) as total_tasks,
-# MAGIC   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
-# MAGIC   SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_tasks,
-# MAGIC   SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_tasks,
-# MAGIC   SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) as blocked_tasks,
-# MAGIC   ROUND(100.0 * SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) / COUNT(*), 1) as completion_pct,
-# MAGIC   MIN(planned_due_date) as earliest_due_date,
-# MAGIC   MAX(actual_completion_timestamp) as latest_completion
-# MAGIC FROM gold.close_status_gold
-# MAGIC GROUP BY period, phase_id, phase_name
-# MAGIC ORDER BY period DESC, phase_id
-
-# COMMAND ----------
-
-print("✓ Created view: vw_close_status_by_phase")
+# MAGIC   pct_tasks_completed,
+# MAGIC   days_since_period_end,
+# MAGIC   days_to_sla,
+# MAGIC   sla_status,
+# MAGIC   agent_summary
+# MAGIC FROM v_current_close_status
+# MAGIC ORDER BY 
+# MAGIC   CASE WHEN bu = 'CONSOLIDATED' THEN 1 ELSE 2 END,
+# MAGIC   bu;
+# MAGIC ```
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### View 3: Close Cockpit - Overdue Tasks
+# MAGIC ### Query 2: Top Variance Drivers
+# MAGIC 
+# MAGIC **User prompt:** "Explain the top 3 drivers of variance between this month's close and the previous forecast"
+# MAGIC 
+# MAGIC **Expected SQL:**
+# MAGIC ```sql
+# MAGIC SELECT 
+# MAGIC   bu,
+# MAGIC   segment,
+# MAGIC   operating_profit_actual_reporting,
+# MAGIC   operating_profit_forecast_reporting,
+# MAGIC   variance_operating_profit,
+# MAGIC   variance_operating_profit_pct,
+# MAGIC   variance_drivers
+# MAGIC FROM v_forecast_accuracy
+# MAGIC WHERE segment != 'ALL'
+# MAGIC ORDER BY ABS(variance_operating_profit) DESC
+# MAGIC LIMIT 3;
+# MAGIC ```
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_overdue_tasks AS
+# MAGIC %md
+# MAGIC ### Query 3: Overdue Tasks
+# MAGIC 
+# MAGIC **User prompt:** "List all tasks that are overdue or blocked and who owns them"
+# MAGIC 
+# MAGIC **Expected SQL:**
+# MAGIC ```sql
 # MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   phase_name,
-# MAGIC   task_id,
 # MAGIC   task_name,
-# MAGIC   bu_code,
+# MAGIC   bu,
 # MAGIC   owner_role,
+# MAGIC   status,
 # MAGIC   planned_due_date,
-# MAGIC   status,
-# MAGIC   DATEDIFF(CURRENT_DATE(), planned_due_date) as days_overdue,
-# MAGIC   comments
-# MAGIC FROM gold.close_status_gold
-# MAGIC WHERE status != 'completed'
-# MAGIC   AND planned_due_date < CURRENT_DATE()
-# MAGIC ORDER BY days_overdue DESC, phase_id, task_id
-
-# COMMAND ----------
-
-print("✓ Created view: vw_overdue_tasks")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### View 4: Close Cockpit - Tasks by BU
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_close_status_by_bu AS
-# MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   COALESCE(bu_code, 'Group') as bu_code,
-# MAGIC   phase_name,
-# MAGIC   COUNT(*) as total_tasks,
-# MAGIC   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks,
-# MAGIC   ROUND(100.0 * SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) / COUNT(*), 1) as completion_pct
-# MAGIC FROM gold.close_status_gold
-# MAGIC GROUP BY period, bu_code, phase_name
-# MAGIC ORDER BY period DESC, bu_code, phase_name
-
-# COMMAND ----------
-
-print("✓ Created view: vw_close_status_by_bu")
+# MAGIC   hours_overdue,
+# MAGIC   blocking_reason,
+# MAGIC   priority
+# MAGIC FROM v_task_details
+# MAGIC WHERE period = (SELECT MAX(period) FROM v_task_details)
+# MAGIC   AND (status = 'blocked' OR (status IN ('pending', 'in_progress') AND hours_overdue > 0))
+# MAGIC ORDER BY 
+# MAGIC   CASE WHEN status = 'blocked' THEN 1 ELSE 2 END,
+# MAGIC   hours_overdue DESC;
+# MAGIC ```
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### View 5: Close Results - P&L Summary
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_close_pl_summary AS
+# MAGIC ### Query 4: BU Deep Dive
+# MAGIC 
+# MAGIC **User prompt:** "Investigate why BU Europe's operating profit is below forecast this month, and summarize the root causes by segment"
+# MAGIC 
+# MAGIC **Expected SQL:**
+# MAGIC ```sql
 # MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   bu_code,
 # MAGIC   segment,
-# MAGIC   account_category,
-# MAGIC   actual_amount,
-# MAGIC   forecast_amount,
-# MAGIC   prior_period_amount,
-# MAGIC   variance_vs_forecast,
-# MAGIC   variance_vs_forecast_pct,
-# MAGIC   variance_vs_prior,
-# MAGIC   variance_vs_prior_pct,
-# MAGIC   fx_impact
-# MAGIC FROM gold.close_results_gold
-# MAGIC WHERE account_category IN ('Revenue', 'COGS', 'OpEx', 'Operating Profit')
-# MAGIC ORDER BY period DESC, bu_code, account_category
-
-# COMMAND ----------
-
-print("✓ Created view: vw_close_pl_summary")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### View 6: Close Results - Consolidated P&L
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_consolidated_pl AS
-# MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   account_category,
-# MAGIC   actual_amount,
-# MAGIC   forecast_amount,
-# MAGIC   prior_period_amount,
-# MAGIC   variance_vs_forecast,
-# MAGIC   variance_vs_forecast_pct,
-# MAGIC   variance_vs_prior,
-# MAGIC   variance_vs_prior_pct
-# MAGIC FROM gold.close_results_gold
-# MAGIC WHERE bu_code = 'CONSOLIDATED'
-# MAGIC   AND segment IS NULL
-# MAGIC   AND account_category IN ('Revenue', 'COGS', 'OpEx', 'Operating Profit')
-# MAGIC ORDER BY period DESC,
-# MAGIC   CASE account_category
-# MAGIC     WHEN 'Revenue' THEN 1
-# MAGIC     WHEN 'COGS' THEN 2
-# MAGIC     WHEN 'OpEx' THEN 3
-# MAGIC     WHEN 'Operating Profit' THEN 4
-# MAGIC   END
-
-# COMMAND ----------
-
-print("✓ Created view: vw_consolidated_pl")
+# MAGIC   revenue_actual_reporting,
+# MAGIC   revenue_forecast_reporting,
+# MAGIC   variance_revenue_pct,
+# MAGIC   operating_profit_actual_reporting,
+# MAGIC   operating_profit_forecast_reporting,
+# MAGIC   variance_operating_profit,
+# MAGIC   variance_operating_profit_pct,
+# MAGIC   assumptions,
+# MAGIC   variance_drivers
+# MAGIC FROM v_forecast_accuracy
+# MAGIC WHERE bu = 'Europe'
+# MAGIC   AND segment != 'ALL'
+# MAGIC ORDER BY ABS(variance_operating_profit) DESC;
+# MAGIC ```
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### View 7: Close Results - Top Variances
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_top_variances AS
+# MAGIC ### Query 5: FX Impact Analysis
+# MAGIC 
+# MAGIC **User prompt:** "What is the total FX impact on operating profit for the current period across all BUs?"
+# MAGIC 
+# MAGIC **Expected SQL:**
+# MAGIC ```sql
 # MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   bu_code,
-# MAGIC   segment,
-# MAGIC   product,
-# MAGIC   region,
-# MAGIC   account_category,
-# MAGIC   actual_amount,
-# MAGIC   forecast_amount,
-# MAGIC   variance_vs_forecast,
-# MAGIC   variance_vs_forecast_pct,
-# MAGIC   ABS(variance_vs_forecast) as abs_variance
-# MAGIC FROM gold.close_results_gold
-# MAGIC WHERE bu_code != 'CONSOLIDATED'
-# MAGIC   AND variance_vs_forecast IS NOT NULL
-# MAGIC   AND ABS(variance_vs_forecast_pct) > 10  -- Only significant variances
-# MAGIC ORDER BY period DESC, abs_variance DESC
-
-# COMMAND ----------
-
-print("✓ Created view: vw_top_variances")
+# MAGIC   bu,
+# MAGIC   fx_impact_reporting,
+# MAGIC   operating_profit_reporting
+# MAGIC FROM v_financial_results_comparison
+# MAGIC WHERE bu != 'CONSOLIDATED'
+# MAGIC UNION ALL
+# MAGIC SELECT 
+# MAGIC   'TOTAL' AS bu,
+# MAGIC   SUM(fx_impact_reporting) AS fx_impact_reporting,
+# MAGIC   SUM(operating_profit_reporting) AS operating_profit_reporting
+# MAGIC FROM v_financial_results_comparison
+# MAGIC WHERE bu != 'CONSOLIDATED'
+# MAGIC ORDER BY fx_impact_reporting DESC;
+# MAGIC ```
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### View 8: Forecast Dashboard - Scenario Comparison
-
-# MAGIC %md
-# MAGIC ### View 8: Forecast Dashboard - Scenario Comparison
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_forecast_scenarios AS
-# MAGIC SELECT 
-# MAGIC   forecast_period,
-# MAGIC   bu_code,
-# MAGIC   segment,
-# MAGIC   scenario,
-# MAGIC   account_category,
-# MAGIC   forecast_amount
-# MAGIC FROM gold.forecast_results_gold
-# MAGIC WHERE account_category IN ('Revenue', 'COGS', 'OpEx', 'Operating Profit')
-# MAGIC ORDER BY forecast_period DESC, bu_code, scenario, account_category
-
-# COMMAND ----------
-
-print("✓ Created view: vw_forecast_scenarios")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### View 9: KPI Dashboard - All Metrics
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_close_kpis AS
-# MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   kpi_category,
-# MAGIC   kpi_name,
-# MAGIC   kpi_value,
-# MAGIC   kpi_unit,
-# MAGIC   target_value,
-# MAGIC   COALESCE(bu_code, 'Group') as bu_code,
-# MAGIC   CASE 
-# MAGIC     WHEN target_value IS NULL THEN 'N/A'
-# MAGIC     WHEN kpi_unit = '%' AND kpi_value >= target_value THEN 'On Target'
-# MAGIC     WHEN kpi_unit = 'days' AND kpi_value <= target_value THEN 'On Target'
-# MAGIC     WHEN kpi_unit = 'count' AND kpi_value <= target_value THEN 'On Target'
-# MAGIC     ELSE 'Below Target'
-# MAGIC   END as target_status,
-# MAGIC   calculation_notes
-# MAGIC FROM gold.close_kpi_gold
-# MAGIC ORDER BY period DESC, kpi_category, bu_code, kpi_name
-
-# COMMAND ----------
-
-print("✓ Created view: vw_close_kpis")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### View 10: Agent Activity Log
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC CREATE OR REPLACE VIEW gold.vw_agent_activity AS
-# MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   agent_name,
-# MAGIC   action_type,
-# MAGIC   log_timestamp,
-# MAGIC   task_id,
-# MAGIC   COALESCE(bu_code, 'Group') as bu_code,
-# MAGIC   decision_rationale,
-# MAGIC   status,
-# MAGIC   execution_time_ms
-# MAGIC FROM gold.close_agent_logs
-# MAGIC ORDER BY log_timestamp DESC
-
-# COMMAND ----------
-
-print("✓ Created view: vw_agent_activity")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Part 2: Sample Dashboard Queries
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Dashboard 1: Close Cockpit
-
-# COMMAND ----------
-
-print("\n" + "="*80)
-print("DASHBOARD 1: CLOSE COCKPIT")
-print("="*80)
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 1: Overall Progress Gauge
-# MAGIC SELECT 
-# MAGIC   completion_pct as value,
-# MAGIC   'Overall Progress' as metric
-# MAGIC FROM gold.vw_close_cockpit_progress
-# MAGIC WHERE period = '2025-12'
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 2: Days Since Period End
-# MAGIC SELECT 
-# MAGIC   DATEDIFF(CURRENT_DATE(), LAST_DAY(TO_DATE('2025-12-01', 'yyyy-MM-dd'))) as days_elapsed,
-# MAGIC   12 as target_days
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 3: Status by Phase (Stacked Bar)
-# MAGIC SELECT 
-# MAGIC   phase_name,
-# MAGIC   completed_tasks,
-# MAGIC   in_progress_tasks,
-# MAGIC   pending_tasks,
-# MAGIC   blocked_tasks
-# MAGIC FROM gold.vw_close_status_by_phase
-# MAGIC WHERE period = '2025-12'
-# MAGIC ORDER BY phase_id
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 4: Overdue Tasks Table
-# MAGIC SELECT 
-# MAGIC   task_name,
-# MAGIC   bu_code,
-# MAGIC   owner_role,
-# MAGIC   days_overdue,
-# MAGIC   status
-# MAGIC FROM gold.vw_overdue_tasks
-# MAGIC WHERE period = '2025-12'
-# MAGIC LIMIT 10
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 5: Recent Agent Actions
-# MAGIC SELECT 
-# MAGIC   agent_name,
-# MAGIC   action_type,
-# MAGIC   decision_rationale,
-# MAGIC   log_timestamp
-# MAGIC FROM gold.vw_agent_activity
-# MAGIC WHERE period = '2025-12'
-# MAGIC ORDER BY log_timestamp DESC
-# MAGIC LIMIT 10
-
-# COMMAND ----------
-
-print("✓ Close Cockpit dashboard queries ready")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Dashboard 2: Close Results
-
-# COMMAND ----------
-
-print("\n" + "="*80)
-print("DASHBOARD 2: CLOSE RESULTS")
-print("="*80)
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 1: Consolidated P&L
-# MAGIC SELECT 
-# MAGIC   account_category,
-# MAGIC   actual_amount,
-# MAGIC   forecast_amount,
-# MAGIC   prior_period_amount,
-# MAGIC   variance_vs_forecast,
-# MAGIC   variance_vs_forecast_pct
-# MAGIC FROM gold.vw_consolidated_pl
-# MAGIC WHERE period = '2025-12'
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 2: BU Performance Matrix (Revenue Growth vs Margin)
-# MAGIC WITH bu_metrics AS (
+# MAGIC ### Query 6: Close Performance Trend
+# MAGIC 
+# MAGIC **User prompt:** "Compare the current close cycle time to the average of the last 6 months"
+# MAGIC 
+# MAGIC **Expected SQL:**
+# MAGIC ```sql
+# MAGIC WITH cycle_time_history AS (
 # MAGIC   SELECT 
-# MAGIC     bu_code,
-# MAGIC     SUM(CASE WHEN account_category = 'Revenue' THEN variance_vs_prior_pct ELSE 0 END) as revenue_growth_pct,
-# MAGIC     100.0 * SUM(CASE WHEN account_category = 'Operating Profit' THEN actual_amount ELSE 0 END) / 
-# MAGIC       NULLIF(SUM(CASE WHEN account_category = 'Revenue' THEN actual_amount ELSE 0 END), 0) as margin_pct
-# MAGIC   FROM gold.close_results_gold
-# MAGIC   WHERE period = '2025-12'
-# MAGIC     AND bu_code != 'CONSOLIDATED'
-# MAGIC     AND segment IS NULL
-# MAGIC   GROUP BY bu_code
+# MAGIC     period,
+# MAGIC     kpi_value AS cycle_time_days
+# MAGIC   FROM financial_close_catalog.gold_layer.close_kpi_gold
+# MAGIC   WHERE kpi_name = 'Close Cycle Time'
+# MAGIC     AND bu = 'CONSOLIDATED'
+# MAGIC     AND period >= (SELECT MAX(period) - 5 FROM financial_close_catalog.gold_layer.close_kpi_gold)
 # MAGIC )
-# MAGIC SELECT * FROM bu_metrics
-# MAGIC ORDER BY margin_pct DESC
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 3: Top 10 Variances
 # MAGIC SELECT 
-# MAGIC   bu_code,
-# MAGIC   segment,
-# MAGIC   account_category,
-# MAGIC   variance_vs_forecast,
-# MAGIC   variance_vs_forecast_pct
-# MAGIC FROM gold.vw_top_variances
-# MAGIC WHERE period = '2025-12'
-# MAGIC LIMIT 10
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 4: Revenue Trend (12 months)
-# MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   SUM(actual_amount) as total_revenue
-# MAGIC FROM gold.close_results_gold
-# MAGIC WHERE account_category = 'Revenue'
-# MAGIC   AND bu_code = 'CONSOLIDATED'
-# MAGIC   AND segment IS NULL
-# MAGIC   AND period >= '2025-01'
-# MAGIC GROUP BY period
-# MAGIC ORDER BY period
-
-# COMMAND ----------
-
-print("✓ Close Results dashboard queries ready")
+# MAGIC   MAX(CASE WHEN period = (SELECT MAX(period) FROM cycle_time_history) THEN cycle_time_days END) AS current_cycle_time,
+# MAGIC   ROUND(AVG(cycle_time_days), 1) AS avg_last_6_months,
+# MAGIC   MAX(cycle_time_days) AS max_last_6_months,
+# MAGIC   MIN(cycle_time_days) AS min_last_6_months
+# MAGIC FROM cycle_time_history;
+# MAGIC ```
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Dashboard 3: Forecast Analysis
-
-# COMMAND ----------
-
-print("\n" + "="*80)
-print("DASHBOARD 3: FORECAST ANALYSIS")
-print("="*80)
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 1: Forecast vs Actuals (Combo Chart)
-# MAGIC SELECT 
-# MAGIC   period,
-# MAGIC   SUM(CASE WHEN account_category = 'Revenue' THEN actual_amount ELSE 0 END) as actual_revenue,
-# MAGIC   SUM(CASE WHEN account_category = 'Revenue' THEN forecast_amount ELSE 0 END) as forecast_revenue,
-# MAGIC   SUM(CASE WHEN account_category = 'Operating Profit' THEN actual_amount ELSE 0 END) as actual_op,
-# MAGIC   SUM(CASE WHEN account_category = 'Operating Profit' THEN forecast_amount ELSE 0 END) as forecast_op
-# MAGIC FROM gold.close_results_gold
-# MAGIC WHERE bu_code = 'CONSOLIDATED'
-# MAGIC   AND segment IS NULL
-# MAGIC   AND period >= '2025-01'
-# MAGIC GROUP BY period
-# MAGIC ORDER BY period
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 2: Scenario Comparison (Base vs Upside vs Downside)
-# MAGIC SELECT 
-# MAGIC   scenario,
-# MAGIC   SUM(CASE WHEN account_category = 'Revenue' THEN forecast_amount ELSE 0 END) as revenue,
-# MAGIC   SUM(CASE WHEN account_category = 'Operating Profit' THEN forecast_amount ELSE 0 END) as operating_profit
-# MAGIC FROM gold.vw_forecast_scenarios
-# MAGIC WHERE forecast_period = '2025-12'
-# MAGIC   AND bu_code = 'CONSOLIDATED'
-# MAGIC GROUP BY scenario
-# MAGIC ORDER BY scenario
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Tile 3: Forecast Accuracy by BU (MAPE)
-# MAGIC SELECT 
-# MAGIC   bu_code,
-# MAGIC   AVG(ABS(variance_vs_forecast_pct)) as mape
-# MAGIC FROM gold.close_results_gold
-# MAGIC WHERE period = '2025-12'
-# MAGIC   AND bu_code != 'CONSOLIDATED'
-# MAGIC   AND segment IS NULL
-# MAGIC   AND account_category IN ('Revenue', 'Operating Profit')
-# MAGIC   AND forecast_amount != 0
-# MAGIC GROUP BY bu_code
-# MAGIC ORDER BY mape
-
-# COMMAND ----------
-
-print("✓ Forecast Analysis dashboard queries ready")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Part 3: Genie Space Configuration
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Genie Space Setup Instructions
-
-# COMMAND ----------
-
-genie_config = """
-================================================================================
-GENIE SPACE CONFIGURATION FOR FINANCIAL CLOSE
-================================================================================
-
-SPACE NAME: Financial Close Assistant
-
-DESCRIPTION:
-AI-powered assistant for FP&A and Controlling teams to analyze monthly 
-financial close results, track progress, and investigate variances.
-
-================================================================================
-TABLES TO INCLUDE:
-================================================================================
-
-Gold Layer (Primary):
-  ✓ gold.close_status_gold - Close progress tracking
-  ✓ gold.close_results_gold - Final P&L with variances
-  ✓ gold.forecast_results_gold - Forecast and scenario analysis
-  ✓ gold.close_kpi_gold - Key performance indicators
-  ✓ gold.close_agent_logs - Agent decision audit trail
-
-Views (Recommended):
-  ✓ gold.vw_close_cockpit_progress
-  ✓ gold.vw_close_status_by_phase
-  ✓ gold.vw_overdue_tasks
-  ✓ gold.vw_consolidated_pl
-  ✓ gold.vw_top_variances
-  ✓ gold.vw_close_kpis
-
-Silver Layer (For Drill-Down):
-  ○ silver.close_trial_balance_std - Detailed trial balance
-  ○ silver.segmented_close_std - Segment-level detail
-
-Config (Reference):
-  ○ config.business_units - BU master data
-  ○ config.close_phase_definitions - Task definitions
-
-================================================================================
-GENERAL INSTRUCTIONS (Paste into Genie Space Settings):
-================================================================================
-
-You are a financial close assistant for FP&A and Controlling teams.
-
-**Fiscal Calendar:**
-- Periods are labeled as 'YYYY-MM' (e.g., '2025-12' for December 2025)
-- Close cycle SLA: 12 business days after month-end
-- Current period: 2025-12 (use this as default if period not specified)
-
-**KPI Definitions:**
-- **Operating Profit** = Revenue + COGS + OpEx (COGS and OpEx are negative)
-- **Operating Margin** = Operating Profit / Revenue × 100
-- **FX Impact** = Difference between local currency and reporting currency (USD) results
-- **Cycle Time** = Days from period end to final publication
-- **Timeliness Score** = % of tasks completed by planned due date
-- **MAPE (Forecast Accuracy)** = Mean Absolute Percentage Error
-
-**Business Unit Codes:**
-- NA = North America (USD)
-- EU = Europe (EUR)
-- UK = United Kingdom (GBP)
-- ASIA = Asia Pacific (CNY)
-- LATAM = Latin America (BRL)
-- INDIA = India (INR)
-- CONSOLIDATED = Group consolidated results
-
-**Account Categories:**
-- Revenue: Product sales, services, other income
-- COGS: Cost of goods sold, direct labor
-- OpEx: Operating expenses (S&M, R&D, G&A, D&A)
-- Interest: Interest expense
-- Tax: Income tax expense
-
-**Response Style:**
-1. Start with executive summary (2-3 sentences)
-2. Provide key numbers with proper formatting (use $ for USD, % for percentages)
-3. Offer drill-down suggestions if the user might want more detail
-4. Always cite the table, period, and BU for transparency
-5. Flag unusual items (variances >10%, overdue tasks, quality issues)
-
-**Data Freshness:**
-- Gold tables are updated after each close phase completes
-- Agent logs are written in real-time as agents run
-- Status updates occur hourly during close period
-
-**Common Patterns:**
-- "Show me X for [period]" - default to period='2025-12' if not specified
-- "What caused Y?" - look at variances, agent logs, and segmented data
-- "Which BUs..." - exclude 'CONSOLIDATED' unless explicitly requested
-- "Top N..." - order by absolute value of variance or amount
-
-**Example Queries:**
-- "Show me close status for December 2025 by phase"
-- "What are the top 3 variance drivers vs forecast?"
-- "List overdue tasks and their owners"
-- "Explain why Europe's operating profit is below forecast"
-- "Compare Base vs Upside scenario for Q1 2026"
-
-================================================================================
-"""
-
-print(genie_config)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Sample Genie Queries (To Save in Space)
-
-# COMMAND ----------
-
-sample_queries = """
-================================================================================
-SAMPLE GENIE QUERIES TO SAVE IN SPACE
-================================================================================
-
-1. CLOSE STATUS & PROGRESS
-   ========================
-   
-   Query: "Show me the status of the current month close by BU and phase"
-   SQL Hint: SELECT bu_code, phase_name, completion_pct FROM gold.vw_close_status_by_bu WHERE period='2025-12'
-   
-   Query: "What tasks are overdue and who owns them?"
-   SQL Hint: SELECT * FROM gold.vw_overdue_tasks WHERE period='2025-12'
-   
-   Query: "How many days has the close been running?"
-   SQL Hint: SELECT DATEDIFF(CURRENT_DATE(), LAST_DAY(TO_DATE('2025-12-01'))) as days_elapsed
-   
-   Query: "What phase are we in and what's the completion percentage?"
-   SQL Hint: SELECT phase_name, completion_pct FROM gold.vw_close_status_by_phase WHERE period='2025-12' AND completion_pct < 100 ORDER BY phase_id LIMIT 1
-
-2. VARIANCE ANALYSIS
-   ==================
-   
-   Query: "Show me the top 3 drivers of variance between this month's close and the previous forecast"
-   SQL Hint: SELECT * FROM gold.vw_top_variances WHERE period='2025-12' LIMIT 3
-   
-   Query: "Explain why BU Europe's operating profit is below forecast this month"
-   Multi-step:
-     1. Get BU-level variance: SELECT * FROM gold.close_results_gold WHERE period='2025-12' AND bu_code='EU' AND account_category='Operating Profit'
-     2. Get segment detail: SELECT segment, variance_vs_forecast FROM gold.close_results_gold WHERE period='2025-12' AND bu_code='EU' ORDER BY ABS(variance_vs_forecast) DESC
-     3. Check agent findings: SELECT decision_rationale FROM gold.close_agent_logs WHERE period='2025-12' AND bu_code='EU' AND action_type='validation'
-   
-   Query: "Which BUs exceeded forecast this month?"
-   SQL Hint: SELECT bu_code, variance_vs_forecast_pct FROM gold.close_results_gold WHERE period='2025-12' AND account_category='Operating Profit' AND variance_vs_forecast_pct > 0
-   
-   Query: "What's the FX impact by BU?"
-   SQL Hint: SELECT bu_code, SUM(fx_impact) as total_fx_impact FROM gold.close_results_gold WHERE period='2025-12' GROUP BY bu_code
-
-3. CONSOLIDATED RESULTS
-   =====================
-   
-   Query: "Show me consolidated P&L for December 2025"
-   SQL Hint: SELECT * FROM gold.vw_consolidated_pl WHERE period='2025-12'
-   
-   Query: "What's our operating margin this month vs last month?"
-   SQL Hint: SELECT period, 100.0 * SUM(CASE WHEN account_category='Operating Profit' THEN actual_amount END) / SUM(CASE WHEN account_category='Revenue' THEN actual_amount END) as margin FROM gold.close_results_gold WHERE bu_code='CONSOLIDATED' AND period IN ('2025-11','2025-12') GROUP BY period
-   
-   Query: "How did revenue trend over the last 6 months?"
-   SQL Hint: SELECT period, actual_amount FROM gold.close_results_gold WHERE account_category='Revenue' AND bu_code='CONSOLIDATED' AND period >= '2025-07' ORDER BY period
-
-4. FORECAST ANALYSIS
-   ==================
-   
-   Query: "Compare forecast scenarios (Base, Upside, Downside) for revenue"
-   SQL Hint: SELECT scenario, forecast_amount FROM gold.forecast_results_gold WHERE forecast_period='2025-12' AND account_category='Revenue' AND bu_code='CONSOLIDATED'
-   
-   Query: "What's our forecast accuracy (MAPE) this month?"
-   SQL Hint: SELECT kpi_value FROM gold.vw_close_kpis WHERE period='2025-12' AND kpi_name='Forecast Accuracy (MAPE)'
-   
-   Query: "Which BU has the best forecast accuracy?"
-   SQL Hint: SELECT bu_code, AVG(ABS(variance_vs_forecast_pct)) as mape FROM gold.close_results_gold WHERE period='2025-12' AND bu_code !='CONSOLIDATED' AND account_category='Revenue' GROUP BY bu_code ORDER BY mape LIMIT 1
-
-5. AGENT INSIGHTS
-   ===============
-   
-   Query: "What did the Pre-Close Agent flag this month?"
-   SQL Hint: SELECT decision_rationale, bu_code FROM gold.close_agent_logs WHERE period='2025-12' AND agent_name='pre_close_agent' AND status='warning'
-   
-   Query: "Show me all agent alerts and warnings"
-   SQL Hint: SELECT agent_name, decision_rationale, log_timestamp FROM gold.vw_agent_activity WHERE period='2025-12' AND status IN ('warning','error') ORDER BY log_timestamp DESC
-   
-   Query: "Did any agents detect unusual variances?"
-   SQL Hint: SELECT decision_rationale FROM gold.close_agent_logs WHERE period='2025-12' AND action_type='validation' AND decision_rationale LIKE '%unusual%'
-
-6. KPIs & METRICS
-   ===============
-   
-   Query: "Show me all KPIs for this close"
-   SQL Hint: SELECT * FROM gold.vw_close_kpis WHERE period='2025-12' AND bu_code='Group'
-   
-   Query: "How long did the close take vs our SLA?"
-   SQL Hint: SELECT kpi_value, target_value FROM gold.vw_close_kpis WHERE period='2025-12' AND kpi_name='Close Cycle Time'
-   
-   Query: "Which BU had the best timeliness score?"
-   SQL Hint: SELECT bu_code, kpi_value FROM gold.vw_close_kpis WHERE period='2025-12' AND kpi_name='BU Timeliness Score' ORDER BY kpi_value DESC LIMIT 1
-
-================================================================================
-"""
-
-print(sample_queries)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Part 4: Dashboard Layout Suggestions
-
-# COMMAND ----------
-
-dashboard_layouts = """
-================================================================================
-DASHBOARD LAYOUTS FOR DATABRICKS SQL / AI-BI
-================================================================================
-
-DASHBOARD 1: CLOSE COCKPIT
-===========================
-Purpose: Real-time monitoring of close progress
-Refresh: Every 15 minutes (or on-demand)
-Audience: FP&A team, Close manager
-
-Layout (3 rows):
-
-Row 1: Key Metrics (Counters)
-  [Overall Progress]  [Days Elapsed]  [Overdue Tasks]  [Agent Alerts]
-     Gauge: 85%        Counter: 12       Counter: 3      Counter: 2
-    Target: 100%      Target: 12 days    Red if >0       Red if >0
-
-Row 2: Phase Progress (Stacked Bar + Table)
-  [Status by Phase - Horizontal Stacked Bar]          [Overdue Tasks - Table]
-  Phase 1: ████████████████████ 100% (18/18)          Task | BU | Owner | Days
-  Phase 2: ████████████████████ 100% (30/30)          301  | EU | FP&A  | 2
-  Phase 3: ████████████████████ 100% (18/18)          302  | UK | FP&A  | 1
-  Phase 4: ████████████████████ 100% (12/12)
-  Phase 5: ████████████████████ 100% (6/6)
-
-Row 3: BU Heatmap + Agent Activity
-  [Tasks by BU - Heatmap]                              [Recent Agent Actions]
-         Phase1 Phase2 Phase3 Phase4 Phase5           Agent     | Action | Time
-  NA       ✅     ✅     ✅     ✅     ✅               FX Agent  | Validated | 10:15
-  EU       ✅     ✅     ✅     ✅     ✅               Pre-Close | Flagged   | 11:30
-  UK       ✅     ✅     ⚠️     ⏳     ⏳               Supervisor| Transitioned|12:00
-  ASIA     ✅     ✅     ✅     ✅     ✅
-  
-Filters: Period (dropdown), Status (multi-select)
-
-
-DASHBOARD 2: CLOSE RESULTS
-===========================
-Purpose: Financial analysis and variance investigation
-Refresh: After Phase 5 completion
-Audience: CFO, FP&A leadership, BU controllers
-
-Layout (4 rows):
-
-Row 1: Consolidated Summary (Cards)
-  [Revenue]           [Operating Profit]     [Operating Margin]    [vs Forecast]
-  $125.5M             $18.3M                 14.6%                 -2.1% ⚠️
-  +3.2% vs LM        +1.8% vs LM            -30 bps vs LM         -$2.7M
-
-Row 2: P&L Waterfall + BU Performance
-  [P&L Waterfall Chart]                                [BU Performance Matrix]
-  Prior │ Volume │ Price │ FX │ Mix │ Current          Scatter: x=Rev Growth%, y=Margin%
-  $122M │ +$2.5M │ +$1.5M│-$0.5M│...│ $125.5M         NA (high/high), EU (low/high), etc.
-
-Row 3: Segment Analysis
-  [Segment Tree Map - by Operating Profit]            [Top 10 Variances - Bar Chart]
-  Enterprise (largest)                                 1. EU-Enterprise-Revenue: -$1.2M
-    └ NA: $5M, EU: $3M, ASIA: $2M                     2. ASIA-Consumer-COGS: +$0.8M
-  SMB                                                  3. NA-SMB-OpEx: +$0.6M
-  Consumer
-  Government (smallest)
-
-Row 4: Trend Analysis
-  [Revenue & OP Trend - Line Chart (12 months)]       [Margin Trend - Area Chart]
-  Revenue: upward trend, slight dip in Dec            Margin: stable 14-15% range
-  OP: following revenue pattern
-
-Filters: Period, BU, Segment, Account Category
-Actions: Click on variance → Drill to segment detail
-
-
-DASHBOARD 3: FORECAST ANALYSIS
-===============================
-Purpose: Forward-looking analysis and scenario planning
-Refresh: After Phase 4 completion
-Audience: CFO, FP&A leadership, Planning team
-
-Layout (3 rows):
-
-Row 1: Actual vs Forecast
-  [Revenue: Actual vs Forecast - Combo Chart]         [Operating Profit: Actual vs Forecast]
-  Bars=Actual, Line=Forecast, 12-month view           Same layout as Revenue
-  Show variance bands (±5% tolerance)
-
-Row 2: Scenario Comparison
-  [Base vs Upside vs Downside - Grouped Bar Chart]    [Scenario Sensitivities - Table]
-                Base    Upside  Downside              Scenario  | Rev | OP  | Margin
-  Revenue      $125M    $144M   $106M                 Base      |$125M|$18M | 14.6%
-  Op Profit    $18M     $22M    $15M                  Upside    |$144M|$22M | 15.3%
-  Margin       14.6%    15.3%   14.2%                 Downside  |$106M|$15M | 14.2%
-
-Row 3: Forecast Accuracy
-  [MAPE by BU - Horizontal Bar]                       [Forecast vs Actual Trend - Line]
-  NA:    3.2% ✅                                      12-month comparison showing accuracy
-  EU:    5.8% ⚠️                                     improvement over time
-  UK:    4.1% ✅
-  ASIA:  6.2% ⚠️
-  LATAM: 7.5% 🔴
-  INDIA: 4.8% ✅
-  
-Filters: Period, Scenario, BU
-Actions: Export to PowerPoint, Schedule email
-
-================================================================================
-DASHBOARD IMPLEMENTATION STEPS
-================================================================================
-
-1. In Databricks SQL workspace, click "Create" → "Dashboard"
-2. Add visualizations using the queries from Part 2
-3. Configure chart types:
-   - Gauges: Use "Counter" visualization with target line
-   - Stacked bars: Use "Bar" with stacking enabled
-   - Heatmaps: Use "Table" with conditional formatting
-   - Waterfalls: Use "Bar" with category ordering
-   - Scatter: Use "Scatter" visualization
-   - Tree map: Use "Tree Map" (if available) or nested bars
-4. Add filters at dashboard level (period, BU, segment)
-5. Configure auto-refresh (15 min for Close Cockpit, manual for others)
-6. Set permissions:
-   - Viewers: All FP&A users
-   - Editors: FP&A architects
-   - Owners: Finance IT team
-7. Schedule email delivery (daily during close, weekly otherwise)
-8. Add dashboard to Genie space for easy discovery
-
-================================================================================
-"""
-
-print(dashboard_layouts)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Part 5: Summary and Next Steps
-
-# COMMAND ----------
-
-summary = """
-================================================================================
-DASHBOARDS & GENIE CONFIGURATION - SUMMARY
-================================================================================
-
-✅ COMPLETED:
--------------
-1. Created 10 SQL views optimized for dashboards:
-   - Close Cockpit: progress, phases, overdue tasks, BU status
-   - Close Results: P&L, variances, trends
-   - Forecast: scenarios, accuracy
-   - KPIs: all metrics with targets
-   - Agent activity logs
-
-2. Provided sample queries for 3 dashboards:
-   - Close Cockpit (real-time monitoring)
-   - Close Results (variance analysis)
-   - Forecast Analysis (scenario planning)
-
-3. Generated Genie space configuration:
-   - Table selection guidance
-   - General instructions with KPI definitions
-   - 25+ sample queries organized by category
-   - Response style guidelines
-
-4. Created dashboard layout specifications:
-   - Detailed mockups for 3 dashboards
-   - Chart type recommendations
-   - Filter and interaction design
-   - Implementation steps
-
-📋 NEXT STEPS (Manual Setup Required):
----------------------------------------
-
-A. Set Up Genie Space:
-   1. Navigate to Genie in Databricks UI
-   2. Create new space: "Financial Close Assistant"
-   3. Add tables from list in "Genie Config" section above
-   4. Paste General Instructions into space settings
-   5. Create and save sample queries from list above
-   6. Test with queries: "Show me close status for December 2025"
-   7. Grant access to FP&A team
-
-B. Create Dashboards:
-   1. Open Databricks SQL workspace
-   2. Create Dashboard 1: Close Cockpit
-      - Add 5 visualizations using queries from Part 2
-      - Configure auto-refresh (15 min)
-   3. Create Dashboard 2: Close Results
-      - Add 6 visualizations
-      - Set up drill-down actions
-   4. Create Dashboard 3: Forecast Analysis
-      - Add 5 visualizations
-      - Configure scenario filters
-   5. Test all dashboards with current data
-   6. Schedule email delivery to FP&A team
-
-C. Integration:
-   1. Add dashboard links to Genie space description
-   2. Create Databricks workspace homepage with:
-      - Quick link to Genie space
-      - Embedded Close Cockpit dashboard
-      - Links to other dashboards
-   3. Set up alerts:
-      - Email when tasks overdue
-      - Slack when agents raise warnings
-      - Daily summary during close period
-
-D. Training & Documentation:
-   1. Create 15-min video walkthrough of:
-      - How to use Genie for close queries
-      - Dashboard navigation and filters
-      - Where to find agent logs and insights
-   2. Prepare Genie "cheat sheet" with top 20 queries
-   3. Schedule training session for FP&A team
-   4. Document troubleshooting (e.g., "no data found" → permissions)
-
-================================================================================
-TESTING CHECKLIST:
-================================================================================
-
-□ Views created successfully (run SELECT * FROM gold.vw_* to verify)
-□ Genie space created and tables added
-□ Sample query in Genie returns results
-□ Close Cockpit dashboard renders without errors
-□ Filters on dashboards work correctly
-□ Drill-down actions navigate to detail views
-□ Email alerts configured and tested
-□ Permissions granted to FP&A users
-□ Training materials prepared
-
-================================================================================
-SUPPORT CONTACTS:
-================================================================================
-
-Genie Issues: Databricks Support (Premium tier)
-Dashboard Design: FP&A Architecture Team
-Data Questions: Data Engineering Team
-Access/Permissions: IT Security Team
-
-For questions about the financial close solution:
-- Solution architecture: FP&A Architects
-- Agent behavior: Review gold.close_agent_logs
-- Data quality: Check silver layer validation rules
-
-================================================================================
-"""
-
-print(summary)
-
-# COMMAND ----------
-
-# Show all views created
-views_created = spark.sql("""
-  SELECT table_name, comment
-  FROM financial_close_lakehouse.information_schema.tables
-  WHERE table_schema = 'gold'
-    AND table_type = 'VIEW'
-  ORDER BY table_name
-""")
-
-print("\n✓ Views Created:")
-display(views_created)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## ✅ Dashboards and Genie Configuration Complete
+# MAGIC ## Genie Space Setup Checklist
 # MAGIC 
-# MAGIC **Deliverables:**
-# MAGIC - ✓ 10 SQL views for dashboards
-# MAGIC - ✓ Sample queries for 3 dashboards
-# MAGIC - ✓ Genie space configuration with instructions
-# MAGIC - ✓ 25+ sample Genie queries
-# MAGIC - ✓ Dashboard layout specifications
-# MAGIC - ✓ Implementation guide
+# MAGIC 1. **Create Genie Space**
+# MAGIC    - Name: "Financial Close Assistant"
+# MAGIC    - Description: "AI assistant for financial close process, analysis, and reporting"
 # MAGIC 
-# MAGIC **Next Steps:**
-# MAGIC 1. Follow "Next Steps" section above to create Genie space
-# MAGIC 2. Build dashboards in Databricks SQL using provided queries
-# MAGIC 3. Test with FP&A team and gather feedback
-# MAGIC 4. Schedule training session
+# MAGIC 2. **Add Tables to Genie Space**
+# MAGIC    - close_status_gold
+# MAGIC    - close_results_gold
+# MAGIC    - forecast_results_gold
+# MAGIC    - close_kpi_gold
+# MAGIC    - close_phase_tasks
+# MAGIC    - close_agent_logs
+# MAGIC    - All helper views (v_*)
 # MAGIC 
-# MAGIC **Documentation:**
-# MAGIC - All configuration text is captured in notebook output
-# MAGIC - Copy-paste instructions directly into Genie UI
-# MAGIC - Use dashboard layouts as mockups for implementation
+# MAGIC 3. **Configure Space Instructions**
+# MAGIC    - Copy the instructions from above
+# MAGIC    - Customize for your organization's specific needs
+# MAGIC 
+# MAGIC 4. **Add Example Queries**
+# MAGIC    - Save all 6 example queries as "Saved Queries"
+# MAGIC    - Name them clearly for easy discovery
+# MAGIC 
+# MAGIC 5. **Set Permissions**
+# MAGIC    - FP&A teams: Full access
+# MAGIC    - BU Controllers: Read access
+# MAGIC    - Leadership: Read access
+# MAGIC    - Restrict write access to service principals/agents
+# MAGIC 
+# MAGIC 6. **Test Genie Responses**
+# MAGIC    - Test each example query
+# MAGIC    - Verify responses are accurate and well-formatted
+# MAGIC    - Adjust instructions if needed
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Summary
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT '
+# MAGIC ========================================
+# MAGIC Dashboard and Genie Setup Complete!
+# MAGIC ========================================
+# MAGIC 
+# MAGIC Created:
+# MAGIC - 6 helper views for dashboard queries
+# MAGIC - 15+ sample dashboard queries across 4 dashboards
+# MAGIC - Genie space instructions and configuration
+# MAGIC - 6 example Genie queries for common use cases
+# MAGIC 
+# MAGIC Next Steps:
+# MAGIC 1. Create Databricks SQL dashboards using the sample queries
+# MAGIC 2. Set up Genie space with instructions and saved queries
+# MAGIC 3. Grant appropriate permissions to user groups
+# MAGIC 4. Train FP&A users on Genie and dashboard usage
+# MAGIC 5. Schedule dashboard refreshes (if needed)
+# MAGIC 
+# MAGIC Dashboard Recommendations:
+# MAGIC - Close Cockpit: Refresh every hour during close period
+# MAGIC - Close Results: Refresh daily
+# MAGIC - Forecast: Refresh weekly
+# MAGIC - KPI Scorecard: Refresh daily
+# MAGIC 
+# MAGIC Genie Best Practices:
+# MAGIC - Use natural language questions
+# MAGIC - Be specific about periods and BUs
+# MAGIC - Ask follow-up questions for deeper analysis
+# MAGIC - Save frequently used queries for quick access
+# MAGIC 
+# MAGIC ========================================
+# MAGIC ' AS summary;
